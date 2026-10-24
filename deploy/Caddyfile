@@ -1,0 +1,19 @@
+# Caddy obtains and renews the TLS certificate for IAM_DOMAIN automatically.
+{$IAM_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		-Server
+	}
+
+	# Swagger UI is disabled in production; refuse the path at the edge too.
+	@docs path /docs /docs/*
+	respond @docs 404
+
+	# Caddy replaces any client-sent X-Forwarded-For with the real client IP,
+	# which the engine reads with IAM_TRUSTED_PROXY_HOPS=1.
+	reverse_proxy iam:8080 {
+		header_up X-Forwarded-Proto https
+	}
+}
