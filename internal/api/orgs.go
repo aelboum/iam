@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"github.com/aelboum/iam/internal/authn"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -220,6 +221,82 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) { s.writeAudi
 func (s *Server) listOrgAudit(w http.ResponseWriter, r *http.Request) {
 	orgID := chi.URLParam(r, "orgID")
 	s.writeAudit(w, r, &orgID)
+}
+
+// --- identity providers (per-org SSO) --------------------------------------------------------
+
+func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name            string   `json:"name"`
+		Issuer          string   `json:"issuer"`
+		ClientID        string   `json:"client_id"`
+		ClientSecret    string   `json:"client_secret"`
+		Scopes          []string `json:"scopes"`
+		AutoCreateUsers *bool    `json:"auto_create_users"`
+		LinkByEmail     bool     `json:"link_by_email"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	orgID := chi.URLParam(r, "orgID")
+	if err := validName("name", body.Name); err != nil {
+		fail(w, r, err)
+		return
+	}
+	// Plain http and private hosts are also refused at connect time outside dev mode.
+	if !redirectURLAllowed(body.Issuer, false, s.devMode) {
+		fail(w, r, validationError("issuer must be an https URL"))
+		return
+	}
+	if body.ClientID == "" || body.ClientSecret == "" || len(body.ClientID) > 256 || len(body.ClientSecret) > 1024 {
+		fail(w, r, validationError("client_id and client_secret are required"))
+		return
+	}
+	if len(body.Scopes) == 0 {
+		body.Scopes = []string{"openid", "profile", "email"}
+	}
+	if err := validList("scopes", body.Scopes); err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := s.checkQuota(r, store.QuotaIDPsPerOrg, orgID); err != nil {
+		fail(w, r, err)
+		return
+	}
+	autoCreate := body.AutoCreateUsers == nil || *body.AutoCreateUsers
+	idp, err := s.store.CreateIDP(r.Context(), store.IDP{
+		OrgID: orgID, Name: body.Name, Issuer: strings.TrimRight(body.Issuer, "/"), ClientID: body.ClientID,
+		ClientSecretEnc: s.box.Seal([]byte(body.ClientSecret)), Scopes: body.Scopes,
+		AutoCreateUsers: autoCreate, LinkByEmail: body.LinkByEmail,
+	})
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, orgID, "idp.created", "idp:"+idp.ID, map[string]any{"issuer": idp.Issuer})
+	writeJSON(w, http.StatusCreated, struct {
+		*store.IDP
+		CallbackURL string `json:"callback_url"`
+	}{idp, s.issuer + authn.CallbackPath})
+}
+
+func (s *Server) listIDPs(w http.ResponseWriter, r *http.Request) {
+	idps, err := s.store.ListIDPs(r.Context(), chi.URLParam(r, "orgID"))
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, idps)
+}
+
+func (s *Server) deleteIDP(w http.ResponseWriter, r *http.Request) {
+	orgID, id := chi.URLParam(r, "orgID"), chi.URLParam(r, "idpID")
+	if err := s.store.DeleteIDP(r.Context(), orgID, id); err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, orgID, "idp.deleted", "idp:"+id, nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) listOrgProjectGrants(w http.ResponseWriter, r *http.Request) {

@@ -30,6 +30,14 @@ internet ──443──> caddy (TLS, HSTS) ──> iam:8080 ──> postgres:54
 6. **Backups:** back up the `pgdata` volume (for example a nightly `pg_dump`) and keep
    the master key separately from the backups.
 
+7. **Rotate the master key** (for example yearly, or right away if it may have leaked):
+   1. Set a new `IAM_MASTER_KEY`, move the old value to `IAM_MASTER_KEY_PREVIOUS`, and restart.
+   2. Run `docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm iam rotate-keys`.
+      It re-encrypts every stored secret (signing keys, TOTP secrets, IdP client secrets)
+      and prints how many it changed. A second run prints 0.
+   3. Remove `IAM_MASTER_KEY_PREVIOUS` and restart. Short-lived opaque tokens and pending
+      email codes from before the rotation stop working; nothing else changes.
+
 ## What the production stack enforces
 
 | Setting | Value | Why |
@@ -47,8 +55,8 @@ redirect URIs refused.
 
 ## Scaling notes
 
-- Rate limits are in memory per instance. With more than one engine instance, the effective
-  limits multiply. Keep a single instance, or add shared limits, before scaling out.
+- The production stack counts rate limits in Postgres (`IAM_SHARED_RATE_LIMITS=true`), so
+  they hold across all engine instances.
 - Signing keys are coordinated through Postgres, so several instances can share one database.
 
 ## Before real customer data

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -365,4 +366,57 @@ func (s *Store) LockSigningKeys(ctx context.Context, fn func(ctx context.Context
 		}
 		return fn(ctx)
 	})
+}
+
+// --- master key rotation -------------------------------------------------------------------
+
+// encryptedColumns lists every column holding data sealed with the master key.
+var encryptedColumns = []struct{ table, key, column string }{
+	{"signing_keys", "id", "private_key_enc"},
+	{"users", "id", "totp_secret_enc"},
+	{"identity_providers", "id", "client_secret_enc"},
+	{"idp_intents", "id", "code_verifier_enc"},
+}
+
+// Reencrypt rewrites every encrypted value for which reseal returns changed,
+// in one transaction. It returns how many values were rewritten.
+func (s *Store) Reencrypt(ctx context.Context, reseal func(sealed []byte) (out []byte, changed bool, err error)) (int, error) {
+	n := 0
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		for _, c := range encryptedColumns { // fixed identifiers, never user input
+			rows, err := tx.Query(ctx, `SELECT `+c.key+`::text, `+c.column+` FROM `+c.table+` WHERE `+c.column+` IS NOT NULL FOR UPDATE`)
+			if err != nil {
+				return mapErr(err)
+			}
+			type item struct {
+				id  string
+				val []byte
+			}
+			var items []item
+			for rows.Next() {
+				var it item
+				if err := rows.Scan(&it.id, &it.val); err != nil {
+					rows.Close()
+					return mapErr(err)
+				}
+				items = append(items, it)
+			}
+			rows.Close()
+			for _, it := range items {
+				out, changed, err := reseal(it.val)
+				if err != nil {
+					return fmt.Errorf("%s %s: %w", c.table, it.id, err)
+				}
+				if !changed {
+					continue
+				}
+				if _, err := tx.Exec(ctx, `UPDATE `+c.table+` SET `+c.column+` = $2 WHERE `+c.key+`::text = $1`, it.id, out); err != nil {
+					return mapErr(err)
+				}
+				n++
+			}
+		}
+		return nil
+	})
+	return n, err
 }

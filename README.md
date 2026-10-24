@@ -10,6 +10,8 @@ Protocol code comes from permissively licensed libraries (no AGPL code):
 | OIDC/OAuth2 provider | `github.com/zitadel/oidc/v3` | Apache-2.0 |
 | Password hashing (argon2id, bcrypt import) | `github.com/zitadel/passwap` | BSD-3-Clause |
 | TOTP | `github.com/pquerna/otp` | Apache-2.0 |
+| Passkeys (WebAuthn) | `github.com/go-webauthn/webauthn` | BSD-3-Clause |
+| SSO client (OIDC relying party) | `github.com/zitadel/oidc/v3/pkg/client/rp` | Apache-2.0 |
 | JOSE/JWT | `github.com/go-jose/go-jose/v4` | Apache-2.0 |
 | Postgres driver | `github.com/jackc/pgx/v5` | MIT |
 | Router | `github.com/go-chi/chi/v5` | MIT |
@@ -44,6 +46,7 @@ Tokens carry the tenant context your backend needs:
 cp .env.example .env    # fill IAM_MASTER_KEY and IAM_BOOTSTRAP_ADMIN_KEY
 docker compose up --build -d
 python scripts/smoke_test.py   # full end-to-end check
+python scripts/features_test.py # SSO, passkeys, machine users, password reset
 python examples/demo/demo.py   # click-through demo at http://localhost:3000
 ```
 
@@ -67,6 +70,9 @@ penetration test).
 | `IAM_LOCKOUT_DURATION` | Default `15m`, after 5 failed attempts. |
 | `IAM_LOGIN_TTL`, `IAM_KEY_ROTATION` | Login session window (`15m`) and signing key rotation (`720h`). |
 | `IAM_AUDIT_RETENTION` | How long audit events are kept (default `8760h`, one year). |
+| `IAM_MASTER_KEY_PREVIOUS` | Old master key(s), comma-separated, accepted for decryption during a rotation. |
+| `IAM_SHARED_RATE_LIMITS` | `true` counts rate limits in Postgres across all instances. |
+| `IAM_WEBAUTHN_RP_ID`, `IAM_WEBAUTHN_ORIGINS` | Passkey domain and login UI origin(s). Default: the issuer's host and origin. |
 
 ## API
 
@@ -123,6 +129,31 @@ key and sending the browser's IP in `X-End-User-IP`. The engine never renders HT
    - `POST /v1/auth-requests/{id}/finalize` `{"session_id","session_token"}` to get `callback_url`.
 4. Your login UI redirects the browser to `callback_url`. The engine then redirects to `redirect_uri?code=...`.
 5. The SaaS exchanges the code at `POST /oauth/token`.
+
+Other ways to authenticate the session in step 3:
+
+- **Passkey (passwordless):** `POST /v1/sessions/{sid}/passkey/begin` gives options for
+  `navigator.credentials.get()`. Send the result to `.../passkey/finish`. A user-verified
+  passkey authenticates on its own (`amr: hwk, mfa`). Users register passkeys with
+  `POST /v1/users/{id}/passkeys/registration` (+ `/finish`). Set `IAM_WEBAUTHN_RP_ID`
+  and `IAM_WEBAUTHN_ORIGINS` to your login UI's domain and origin.
+- **SSO with the org's own IdP:**
+  - An org admin adds an OpenID Connect provider (`POST /v1/orgs/{id}/idps`) and
+    registers the returned `callback_url` at that IdP.
+  - `POST /v1/federated-logins` gives an `auth_url`. After the IdP login, the browser
+    returns to your `return_url?intent=&code=`.
+  - `POST /v1/federated-logins/{intent}/redeem` gives an authenticated session (`amr: fed`).
+  - Users are created on first login (JIT) and linked by IdP subject.
+- **Forgot password:** `POST /v1/password-resets` returns a token for your backend to
+  email. `POST /v1/password-resets/confirm` sets the new password and ends all sessions.
+
+**Machine users** (service accounts) call APIs without a person:
+
+- Create one with `POST /v1/orgs/{id}/machine-users` (the secret is shown once), and
+  grant it roles like any user.
+- Get a token with `POST /oauth/token` `grant_type=client_credentials` and
+  `scope=urn:iam:project:<project id>`. The token carries `org_id` and `roles` as for
+  users.
 
 OIDC endpoints (from `/.well-known/openid-configuration`): `/authorize`, `/oauth/token`,
 `/userinfo`, `/oauth/introspect`, `/revoke`, `/end_session`, `/keys`.
@@ -201,9 +232,36 @@ All of these are exercised by `scripts/smoke_test.py`.
 - Mutating requests finish even if the client disconnects, so no change is left half applied.
 - `.dockerignore` keeps `.env` and demo state out of image builds.
 
+**SSO, passkeys, machine users**
+- SSO: ID tokens are verified (signature, issuer, audience, nonce, PKCE). The callback is
+  single use, and the redeem code is single use and expires after 5 minutes.
+  - Outside dev mode the engine only contacts IdPs over https and refuses private and
+    loopback addresses (checked after DNS resolution), so a tenant cannot use its IdP
+    URL to probe your network.
+  - Linking to an existing account by email is off by default and requires a verified
+    email from the IdP.
+- Passkeys:
+  - User verification is required.
+  - Each challenge can be answered once.
+  - A cloned authenticator (signature counter going backwards) is refused.
+  - Unknown users get identical-looking options.
+- Machine users cannot log in interactively, have no password or TOTP, and can only get
+  roles for projects their org was granted. Rotating the secret ends their tokens.
+- Password reset tokens are single use, expire after 30 minutes and are rate-limited to
+  one per minute.
+
+**Key management**
+- Master key rotation:
+  1. Set the new key in `IAM_MASTER_KEY` and the old one in `IAM_MASTER_KEY_PREVIOUS`,
+     then restart.
+  2. Run `iamd rotate-keys` (`docker compose run --rm iam rotate-keys`).
+  3. Remove the old key.
+  - Opaque access tokens and pending email codes issued under the old key stop working,
+    which is harmless because they are short-lived.
+
 **Known limits**
-- Rate limits are in memory per instance; with several instances behind a load balancer,
-  the effective limit is multiplied by the instance count.
+- Rate limits are in memory per instance by default. Set `IAM_SHARED_RATE_LIMITS=true`
+  to count them in Postgres across all instances (one-minute windows).
 - `X-End-User-IP` is trusted from API-key holders on the login API. Only give keys to your own backends.
 - Per-tenant quotas: 100k users, 100 projects and 50 API keys per org; 50 apps and 200
   roles per project. Lists are paginated (`?limit=`, max 1000, and `?offset=`).
@@ -211,14 +269,15 @@ All of these are exercised by `scripts/smoke_test.py`.
 - Usernames are ASCII and case-insensitive; email codes are HMAC-protected with a 1-minute cooldown.
 - JWT access tokens stay valid for up to 5 minutes after revocation unless your backend
   introspects them. Use introspection for sensitive operations.
-- The master key cannot be rotated yet.
+- SSO logins count as fully authenticated: the org's IdP is responsible for its own MFA.
 
 ## Not yet implemented (next milestones)
 
-- Passkeys/WebAuthn (`go-webauthn/webauthn`, BSD-3)
-- Per-org external IdPs / SSO (OIDC/SAML federation) and JIT provisioning
-- Org domain verification and email-based org discovery
-- Password reset flow and breached-password checks
-- Machine users / `client_credentials`, per-org login policy and branding
-- Shared (Redis/Postgres) rate limits for multi-instance deployments, master key rotation
-- SAML IdP (`zitadel/saml`, Apache-2.0)
+- SAML federation and a SAML IdP (`zitadel/saml`, Apache-2.0)
+- Org domain verification and email-based org discovery (home realm discovery)
+- Breached-password checks, per-org login policy and branding
+- Usernameless (discoverable) passkey login
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE). Bundled dependencies keep their own licenses (listed at the top of this file).

@@ -11,6 +11,20 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// Allower is a rate limiter keyed by string. The in-memory Limiter counts per
+// engine instance; a shared implementation (see store.PGLimiter) counts across
+// all instances.
+type Allower interface {
+	Allow(key string) bool
+}
+
+// Factory builds a named limiter allowing perMinute events per key, with
+// bursts up to burst.
+type Factory func(name string, perMinute float64, burst int) Allower
+
+// Memory is the Factory for in-memory limiters.
+func Memory(_ string, perMinute float64, burst int) Allower { return New(perMinute, burst) }
+
 type entry struct {
 	limiter  *rate.Limiter
 	lastSeen time.Time

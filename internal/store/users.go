@@ -25,11 +25,42 @@ type User struct {
 	// LockedUntil is the temporary lockout after too many failed logins.
 	LockedUntil  *time.Time `json:"locked_until"`
 	TOTPLastStep *int64     `json:"-"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// Kind is human (logs in interactively) or machine (client credentials).
+	Kind             string    `json:"kind"`
+	ClientID         *string   `json:"client_id,omitempty"`
+	ClientSecretHash *string   `json:"-"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+const (
+	KindHuman   = "human"
+	KindMachine = "machine"
+)
+
 func (u *User) HasPassword() bool { return u.PasswordHash != nil }
+
+// CreateMachineUser adds a machine user that authenticates with client
+// credentials. Machine users have no email or password and cannot log in
+// through the session API.
+func (s *Store) CreateMachineUser(ctx context.Context, orgID, name, clientID, secretHash string) (*User, error) {
+	id := uuid.NewString()
+	return scanUser(s.pool.QueryRow(ctx, `
+		INSERT INTO users (id, org_id, username, email, email_verified, given_name, kind, client_id, client_secret_hash)
+		VALUES ($1, $2, $3, $4, true, $3, 'machine', $5, $6) RETURNING `+userColumns,
+		id, orgID, name, id+"@machine.invalid", clientID, secretHash))
+}
+
+// GetMachineUserByClientID finds an unlocked machine user by its client id.
+func (s *Store) GetMachineUserByClientID(ctx context.Context, clientID string) (*User, error) {
+	return scanUser(s.pool.QueryRow(ctx,
+		`SELECT `+userColumns+` FROM users WHERE client_id = $1 AND kind = 'machine'`, clientID))
+}
+
+// SetClientSecret replaces a machine user's secret.
+func (s *Store) SetClientSecret(ctx context.Context, userID, secretHash string) error {
+	return s.execOne(ctx, `UPDATE users SET client_secret_hash = $2, updated_at = now() WHERE id = $1 AND kind = 'machine'`, userID, secretHash)
+}
 
 // MFARequired reports whether login must include a second factor.
 func (u *User) MFARequired() bool { return u.TOTPVerified }
@@ -41,13 +72,14 @@ func (u *User) IsLocked() bool {
 
 const userColumns = `id, org_id, username, email, email_verified, given_name, family_name,
 	password_hash, totp_secret_enc, totp_verified, failed_logins, locked, locked_until,
-	totp_last_step, created_at, updated_at`
+	totp_last_step, created_at, updated_at, kind, client_id, client_secret_hash`
 
 func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	if err := row.Scan(&u.ID, &u.OrgID, &u.Username, &u.Email, &u.EmailVerified, &u.GivenName,
 		&u.FamilyName, &u.PasswordHash, &u.TOTPSecretEnc, &u.TOTPVerified, &u.FailedLogins,
-		&u.Locked, &u.LockedUntil, &u.TOTPLastStep, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		&u.Locked, &u.LockedUntil, &u.TOTPLastStep, &u.CreatedAt, &u.UpdatedAt, &u.Kind, &u.ClientID,
+		&u.ClientSecretHash); err != nil {
 		return nil, mapErr(err)
 	}
 	return &u, nil
@@ -80,10 +112,10 @@ func (s *Store) GetUser(ctx context.Context, id string) (*User, error) {
 func (s *Store) FindUserForLogin(ctx context.Context, orgID, loginName string) (*User, error) {
 	if strings.Contains(loginName, "@") {
 		return scanUser(s.pool.QueryRow(ctx,
-			`SELECT `+userColumns+` FROM users WHERE org_id = $1 AND lower(email) = lower($2)`, orgID, loginName))
+			`SELECT `+userColumns+` FROM users WHERE org_id = $1 AND kind = 'human' AND lower(email) = lower($2)`, orgID, loginName))
 	}
 	return scanUser(s.pool.QueryRow(ctx,
-		`SELECT `+userColumns+` FROM users WHERE org_id = $1 AND lower(username) = lower($2)`, orgID, loginName))
+		`SELECT `+userColumns+` FROM users WHERE org_id = $1 AND kind = 'human' AND lower(username) = lower($2)`, orgID, loginName))
 }
 
 func (s *Store) ListUsers(ctx context.Context, orgID string, p Page) ([]*User, error) {

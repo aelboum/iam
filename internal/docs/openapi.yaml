@@ -32,6 +32,12 @@ tags:
   - name: Roles
   - name: Apps
   - name: Project grants
+  - name: Machine users
+    description: Service accounts using the client credentials grant.
+  - name: SSO
+    description: Per-org external OpenID Connect identity providers.
+  - name: Passkeys
+  - name: Password reset
   - name: Sessions
     description: Headless login, called by your login UI backend.
   - name: Auth requests
@@ -592,6 +598,253 @@ paths:
       responses:
         "204": { description: Revoked }
 
+  /v1/orgs/{orgID}/machine-users:
+    parameters: [{ $ref: "#/components/parameters/orgID" }]
+    post:
+      tags: [Machine users]
+      summary: Create a machine user (service account)
+      description: |
+        Returns `client_id` and `client_secret` (shown once). Get tokens with
+        `POST /oauth/token` `grant_type=client_credentials` (HTTP Basic auth). Add the
+        scope `urn:iam:project:<project id>` to receive that project's roles in the token.
+        Grant roles with the normal user grant endpoints.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, example: billing-sync }
+      responses:
+        "201": { description: Created; includes client_secret once }
+
+  /v1/users/{userID}/client-secret:
+    parameters: [{ $ref: "#/components/parameters/userID" }]
+    post:
+      tags: [Machine users]
+      summary: Rotate a machine user's secret (old secret and tokens stop working)
+      responses:
+        "200": { description: New client_id and client_secret }
+
+  /v1/orgs/{orgID}/idps:
+    parameters: [{ $ref: "#/components/parameters/orgID" }]
+    post:
+      tags: [SSO]
+      summary: Add an OpenID Connect identity provider for the org ("bring your own SSO")
+      description: Register the returned `callback_url` as redirect URI at the IdP. Outside dev mode the issuer must be https and on a public address.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, issuer, client_id, client_secret]
+              properties:
+                name: { type: string, example: Okta }
+                issuer: { type: string, example: "https://acme.okta.com" }
+                client_id: { type: string }
+                client_secret: { type: string }
+                scopes: { type: array, items: { type: string }, default: [openid, profile, email] }
+                auto_create_users: { type: boolean, default: true, description: Create a user on first login (JIT) }
+                link_by_email: { type: boolean, default: false, description: Link to an existing user with the same verified email }
+      responses:
+        "201": { description: Created; includes callback_url }
+    get:
+      tags: [SSO]
+      summary: List the org's identity providers
+      responses:
+        "200": { description: Identity providers }
+
+  /v1/orgs/{orgID}/idps/{idpID}:
+    parameters:
+      - { $ref: "#/components/parameters/orgID" }
+      - { name: idpID, in: path, required: true, schema: { type: string, format: uuid } }
+    delete:
+      tags: [SSO]
+      summary: Remove an identity provider (its linked identities are removed too)
+      responses:
+        "204": { description: Deleted }
+
+  /v1/federated-logins:
+    post:
+      tags: [SSO]
+      summary: Start an SSO login; send the browser to auth_url
+      description: |
+        After the IdP login the browser returns to `return_url?intent=...&code=...`
+        (or `&error=...`). Exchange intent and code at `/v1/federated-logins/{intentID}/redeem`.
+      parameters: [{ $ref: "#/components/parameters/endUserIP" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [org, idp_id, return_url]
+              properties:
+                org: { type: string }
+                idp_id: { type: string, format: uuid }
+                return_url: { type: string, example: "https://app.example.com/sso-return" }
+      responses:
+        "201":
+          description: Intent created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  intent_id: { type: string }
+                  auth_url: { type: string }
+
+  /v1/federated-logins/{intentID}/redeem:
+    parameters:
+      - { name: intentID, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SSO]
+      summary: Exchange a completed SSO login for an authenticated session (single use)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        "201": { $ref: "#/components/responses/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /v1/password-resets:
+    post:
+      tags: [Password reset]
+      summary: Issue a password reset token (your backend emails it)
+      description: Returns 202 with no token for unknown users, so show the same message either way. One request per minute per user.
+      parameters: [{ $ref: "#/components/parameters/endUserIP" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [org, login_name]
+              properties:
+                org: { type: string }
+                login_name: { type: string }
+      responses:
+        "202":
+          description: Token (if the user exists)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  email: { type: string }
+                  expires_at: { type: string, format: date-time }
+        "429": { $ref: "#/components/responses/Error" }
+
+  /v1/password-resets/confirm:
+    post:
+      tags: [Password reset]
+      summary: Set a new password with a reset token (single use; ends all sessions)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string }
+                password: { type: string, minLength: 10 }
+      responses:
+        "204": { description: Password changed }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /v1/users/{userID}/passkeys/registration:
+    parameters: [{ $ref: "#/components/parameters/userID" }]
+    post:
+      tags: [Passkeys]
+      summary: Start passkey registration; pass the result to navigator.credentials.create()
+      responses:
+        "200": { description: PublicKeyCredentialCreationOptions (as `publicKey`) }
+
+  /v1/users/{userID}/passkeys/registration/finish:
+    parameters: [{ $ref: "#/components/parameters/userID" }]
+    post:
+      tags: [Passkeys]
+      summary: Finish registration with the browser's credential (JSON form)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [credential]
+              properties:
+                name: { type: string, example: MacBook }
+                credential: { type: object, description: PublicKeyCredential.toJSON() }
+      responses:
+        "201": { description: Passkey stored }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /v1/users/{userID}/passkeys:
+    parameters: [{ $ref: "#/components/parameters/userID" }]
+    get:
+      tags: [Passkeys]
+      summary: List the user's passkeys
+      responses:
+        "200": { description: Passkeys }
+
+  /v1/users/{userID}/passkeys/{credentialID}:
+    parameters:
+      - { $ref: "#/components/parameters/userID" }
+      - { name: credentialID, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [Passkeys]
+      summary: Remove a passkey
+      responses:
+        "204": { description: Deleted }
+
+  /v1/sessions/{sessionID}/passkey/begin:
+    parameters: [{ $ref: "#/components/parameters/sessionID" }]
+    post:
+      tags: [Sessions]
+      summary: Start passkey login; pass the result to navigator.credentials.get()
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token]
+              properties:
+                session_token: { type: string }
+      responses:
+        "200": { description: PublicKeyCredentialRequestOptions (as `publicKey`) }
+
+  /v1/sessions/{sessionID}/passkey/finish:
+    parameters: [{ $ref: "#/components/parameters/sessionID" }]
+    post:
+      tags: [Sessions]
+      summary: Finish passkey login; a user-verified passkey alone authenticates the session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token, credential]
+              properties:
+                session_token: { type: string }
+                credential: { type: object, description: PublicKeyCredential.toJSON() }
+      responses:
+        "200": { $ref: "#/components/responses/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
   /v1/sessions:
     post:
       tags: [Sessions]
@@ -867,6 +1120,8 @@ components:
         given_name: { type: string }
         family_name: { type: string }
         totp_enabled: { type: boolean }
+        kind: { type: string, enum: [human, machine] }
+        client_id: { type: string, description: Machine users only }
         locked: { type: boolean, description: Manual lock by an administrator }
         locked_until: { type: string, format: date-time, nullable: true, description: Temporary lockout after failed logins }
         created_at: { type: string, format: date-time }
@@ -924,6 +1179,9 @@ components:
         user_id: { type: string, format: uuid, description: Only after the password was verified }
         password_checked: { type: boolean }
         totp_checked: { type: boolean }
+        passkey_checked: { type: boolean }
+        idp_checked: { type: boolean }
+        amr: { type: array, items: { type: string }, description: "How the user authenticated: pwd, otp, mfa, hwk, fed" }
         mfa_required: { type: boolean }
         authenticated: { type: boolean }
         expires_at: { type: string, format: date-time }

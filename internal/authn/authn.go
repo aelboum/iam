@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/pquerna/otp/totp"
 	"github.com/zitadel/passwap"
 	"github.com/zitadel/passwap/argon2"
@@ -49,11 +51,18 @@ const (
 
 type Config struct {
 	IssuerName string
+	// Issuer is the engine's public URL (for the federation callback).
+	Issuer string
+	// DevMode allows identity providers on private networks and plain http.
+	DevMode  bool
+	WebAuthn *webauthn.WebAuthn
 	// CodeKey keys the HMAC of stored email codes, so a database leak alone
 	// does not reveal them (6-digit codes are trivially brute-forced from a plain hash).
 	CodeKey         [32]byte
 	SessionLifetime time.Duration
 	MaxFailedLogins int
+	// Limits builds the rate limiters (in-memory or shared).
+	Limits          ratelimit.Factory
 	LockoutDuration time.Duration
 }
 
@@ -63,9 +72,12 @@ type Service struct {
 	passwords *passwap.Swapper
 	cfg       Config
 	// accountLimit caps password/TOTP attempts per user, whatever the source IP.
-	accountLimit *ratelimit.Limiter
+	accountLimit ratelimit.Allower
 	// dummyHash is verified for unknown users so response time does not reveal them.
 	dummyHash string
+	// httpClient talks to external identity providers (SSRF-guarded).
+	httpClient *http.Client
+	webauthn   *webauthn.WebAuthn
 }
 
 func NewService(st *store.Store, box *secret.Box, cfg Config) *Service {
@@ -79,7 +91,9 @@ func NewService(st *store.Store, box *secret.Box, cfg Config) *Service {
 			bcrypt.NewVerifier(nil),
 		),
 		cfg:          cfg,
-		accountLimit: ratelimit.New(10, 10),
+		accountLimit: cfg.Limits("login-account", 10, 10),
+		httpClient:   NewOutboundClient(cfg.DevMode),
+		webauthn:     cfg.WebAuthn,
 	}
 	hash, err := s.passwords.Hash(secret.Token(16))
 	if err != nil {
@@ -221,18 +235,101 @@ func (s *Service) ConfirmEmail(ctx context.Context, user *store.User, code strin
 	return err
 }
 
+// --- password reset -------------------------------------------------------------------------
+
+const passwordResetLifetime = 30 * time.Minute
+
+// PasswordReset is returned to the login backend, which emails the token to
+// the user (typically as a link to its reset page).
+type PasswordReset struct {
+	Token     string    `json:"token"`
+	Email     string    `json:"email"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// StartPasswordReset issues a single-use reset token for a human user. For an
+// unknown login name it returns nil without error, so the end user always
+// sees the same "if the account exists, we sent an email" message.
+func (s *Service) StartPasswordReset(ctx context.Context, c Client, orgID, loginName string) (*PasswordReset, error) {
+	user, err := s.store.FindUserForLogin(ctx, orgID, loginName)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	if user.Kind != store.KindHuman || user.Locked {
+		return nil, nil // machine users have no password; a manual lock stays in force
+	}
+	token := secret.Token(32)
+	expires := time.Now().Add(passwordResetLifetime)
+	if err := s.store.CreatePasswordReset(ctx, user.ID, secret.Hash(token), expires); err != nil {
+		if errors.Is(err, store.ErrTooSoon) {
+			return nil, ErrRateLimited
+		}
+		return nil, err
+	}
+	s.audit(ctx, c, user, "user.password_reset_requested", nil)
+	return &PasswordReset{Token: token, Email: user.Email, ExpiresAt: expires}, nil
+}
+
+// ConfirmPasswordReset sets a new password with a reset token. All sessions
+// and tokens are revoked and any failed-login lockout is cleared. If allowOrg
+// is set, the token must belong to a user of that org.
+func (s *Service) ConfirmPasswordReset(ctx context.Context, c Client, token, password string) error {
+	if len(token) > 128 {
+		return ErrInvalidCredentials
+	}
+	// Check the new password before using up the token, so a rejected
+	// password does not force the user to request a new email.
+	userID, err := s.store.PeekPasswordReset(ctx, secret.Hash(token))
+	if errors.Is(err, store.ErrNotFound) {
+		return ErrInvalidCredentials
+	} else if err != nil {
+		return err
+	}
+	user, err := s.store.GetUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if c.OrgID != "" && c.OrgID != user.OrgID {
+		return ErrInvalidCredentials
+	}
+	hash, err := s.HashPassword(password, user.Username, user.Email)
+	if err != nil {
+		return err
+	}
+	if _, err := s.store.ConsumePasswordReset(ctx, secret.Hash(token)); err != nil {
+		return ErrInvalidCredentials // used concurrently
+	}
+	if err := s.store.SetPasswordHash(ctx, user.ID, hash); err != nil {
+		return err
+	}
+	if err := s.store.RevokeUserTokens(ctx, user.ID); err != nil {
+		return err
+	}
+	if err := s.store.ClearTemporaryLockout(ctx, user.ID); err != nil {
+		return err
+	}
+	s.audit(ctx, c, user, "user.password_reset", nil)
+	return nil
+}
+
 // --- sessions ---------------------------------------------------------------------------
 
 // SessionState is the view of a session returned to the login UI.
 type SessionState struct {
-	ID              string     `json:"session_id"`
-	Token           string     `json:"session_token,omitempty"`
-	PasswordChecked bool       `json:"password_checked"`
-	TOTPChecked     bool       `json:"totp_checked"`
-	MFARequired     bool       `json:"mfa_required"`
-	Authenticated   bool       `json:"authenticated"`
-	ExpiresAt       time.Time  `json:"expires_at"`
-	AuthTime        *time.Time `json:"auth_time,omitempty"`
+	ID              string `json:"session_id"`
+	Token           string `json:"session_token,omitempty"`
+	PasswordChecked bool   `json:"password_checked"`
+	TOTPChecked     bool   `json:"totp_checked"`
+	PasskeyChecked  bool   `json:"passkey_checked"`
+	IDPChecked      bool   `json:"idp_checked"`
+	MFARequired     bool   `json:"mfa_required"`
+	// AMR lists how the user authenticated (RFC 8176 values), once authenticated.
+	AMR           []string   `json:"amr,omitempty"`
+	Authenticated bool       `json:"authenticated"`
+	ExpiresAt     time.Time  `json:"expires_at"`
+	AuthTime      *time.Time `json:"auth_time,omitempty"`
 	// Only revealed once the password was verified.
 	OrgID  string `json:"org_id,omitempty"`
 	UserID string `json:"user_id,omitempty"`
@@ -442,24 +539,41 @@ func (s *Service) DeleteSession(ctx context.Context, c Client, id, token string)
 }
 
 func (s *Service) state(sess *store.Session, user *store.User) *SessionState {
+	known := user != nil
 	st := &SessionState{
 		ID:              sess.ID,
-		PasswordChecked: sess.PasswordCheckedAt != nil && user != nil,
+		PasswordChecked: known && sess.PasswordCheckedAt != nil,
 		TOTPChecked:     sess.TOTPCheckedAt != nil,
+		PasskeyChecked:  known && sess.PasskeyCheckedAt != nil,
+		IDPChecked:      known && sess.IDPCheckedAt != nil,
 		ExpiresAt:       sess.ExpiresAt,
 	}
-	// Nothing about the user is revealed before the password was verified.
-	if st.PasswordChecked {
+	// Nothing about the user is revealed before a first factor was verified.
+	if st.PasswordChecked || st.PasskeyChecked || st.IDPChecked {
 		st.OrgID, st.UserID = sess.OrgID, user.ID
 		st.MFARequired = user.MFARequired()
 	}
-	st.Authenticated = st.PasswordChecked && (!st.MFARequired || st.TOTPChecked)
-	if st.Authenticated {
-		t := *sess.PasswordCheckedAt
-		if sess.TOTPCheckedAt != nil && sess.TOTPCheckedAt.After(t) {
-			t = *sess.TOTPCheckedAt
+	// A session is authenticated by one of: a user-verified passkey (phishing
+	// resistant, counts as multi-factor), a federated login (the org's IdP is
+	// responsible for its MFA), or the password plus TOTP when enrolled.
+	var at *time.Time
+	switch {
+	case st.PasskeyChecked:
+		at, st.AMR = sess.PasskeyCheckedAt, []string{"hwk", "user", "mfa"}
+	case st.IDPChecked:
+		at, st.AMR = sess.IDPCheckedAt, []string{"fed"}
+	case st.PasswordChecked && (!st.MFARequired || st.TOTPChecked):
+		at, st.AMR = sess.PasswordCheckedAt, []string{"pwd"}
+		if st.TOTPChecked {
+			st.AMR = append(st.AMR, "otp", "mfa")
+			if sess.TOTPCheckedAt.After(*at) {
+				at = sess.TOTPCheckedAt
+			}
 		}
-		st.AuthTime = &t
+	}
+	if at != nil {
+		t := *at
+		st.Authenticated, st.AuthTime = true, &t
 	}
 	return st
 }
@@ -553,10 +667,7 @@ func (s *Service) FinalizeAuthRequest(ctx context.Context, c Client, authRequest
 		s.audit(ctx, c, user, "login.denied", map[string]any{"client_id": app.ClientID, "reason": "no project grant"})
 		return ErrNoAccess
 	}
-	amr := []string{"pwd"}
-	if state.TOTPChecked {
-		amr = append(amr, "otp", "mfa")
-	}
+	amr := state.AMR
 	if err := s.store.CompleteAuthRequest(ctx, ar.ID, user.ID, *state.AuthTime, amr); err != nil {
 		return err
 	}

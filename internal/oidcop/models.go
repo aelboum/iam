@@ -135,3 +135,50 @@ func (r *refreshTokenRequest) GetClientID() string              { return r.t.Cli
 func (r *refreshTokenRequest) GetScopes() []string              { return r.t.Scopes }
 func (r *refreshTokenRequest) GetSubject() string               { return r.t.Subject }
 func (r *refreshTokenRequest) SetCurrentScopes(scopes []string) { r.t.Scopes = scopes }
+
+// ProjectScopePrefix selects the project whose roles a machine token carries:
+// scope "urn:iam:project:<project id>".
+const ProjectScopePrefix = "urn:iam:project:"
+
+// machineClient adapts a machine user to op.Client for the client
+// credentials grant.
+type machineClient struct {
+	user *store.User
+}
+
+var _ op.Client = (*machineClient)(nil)
+
+func (c *machineClient) GetID() string                       { return *c.user.ClientID }
+func (c *machineClient) RedirectURIs() []string              { return nil }
+func (c *machineClient) PostLogoutRedirectURIs() []string    { return nil }
+func (c *machineClient) ApplicationType() op.ApplicationType { return op.ApplicationTypeWeb }
+func (c *machineClient) AuthMethod() oidc.AuthMethod         { return oidc.AuthMethodBasic }
+func (c *machineClient) ResponseTypes() []oidc.ResponseType  { return nil }
+func (c *machineClient) GrantTypes() []oidc.GrantType {
+	return []oidc.GrantType{oidc.GrantTypeClientCredentials}
+}
+func (c *machineClient) LoginURL(string) string              { return "" }
+func (c *machineClient) AccessTokenType() op.AccessTokenType { return op.AccessTokenTypeJWT }
+func (c *machineClient) IDTokenLifetime() time.Duration      { return time.Hour }
+func (c *machineClient) DevMode() bool                       { return false }
+func (c *machineClient) RestrictAdditionalIdTokenScopes() func([]string) []string {
+	return func(scopes []string) []string { return scopes }
+}
+func (c *machineClient) RestrictAdditionalAccessTokenScopes() func([]string) []string {
+	return func(scopes []string) []string { return scopes }
+}
+func (c *machineClient) IsScopeAllowed(scope string) bool {
+	return strings.HasPrefix(scope, ProjectScopePrefix)
+}
+func (c *machineClient) IDTokenUserinfoClaimsAssertion() bool { return false }
+func (c *machineClient) ClockSkew() time.Duration             { return 0 }
+
+// projectFromScopes returns the project selected with ProjectScopePrefix, if any.
+func projectFromScopes(scopes []string) string {
+	for _, scope := range scopes {
+		if projectID, ok := strings.CutPrefix(scope, ProjectScopePrefix); ok {
+			return projectID
+		}
+	}
+	return ""
+}

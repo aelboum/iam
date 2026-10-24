@@ -1,12 +1,14 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aelboum/iam/internal/secret"
 	"github.com/aelboum/iam/internal/store"
 )
 
@@ -210,6 +212,10 @@ func (s *Server) setPassword(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
+	if err := humanOnly(user); err != nil {
+		fail(w, r, err)
+		return
+	}
 	var body struct {
 		Password string `json:"password"`
 	}
@@ -271,6 +277,10 @@ func (s *Server) startEmailVerification(w http.ResponseWriter, r *http.Request) 
 		fail(w, r, err)
 		return
 	}
+	if err := humanOnly(user); err != nil {
+		fail(w, r, err)
+		return
+	}
 	code, expires, err := s.authn.StartEmailVerification(r.Context(), user)
 	if err != nil {
 		fail(w, r, err)
@@ -318,6 +328,10 @@ func (s *Server) logoutUser(w http.ResponseWriter, r *http.Request) {
 func (s *Server) enrollTOTP(w http.ResponseWriter, r *http.Request) {
 	user, err := s.userForCaller(r, chi.URLParam(r, "userID"))
 	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := humanOnly(user); err != nil {
 		fail(w, r, err)
 		return
 	}
@@ -486,4 +500,153 @@ func (s *Server) deleteUserGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r, user.OrgID, "user_grant.deleted", "user:"+user.ID, map[string]any{"project_id": grant.ProjectID})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- machine users -------------------------------------------------------------------------
+
+// createMachineUser adds a service account that gets tokens with the client
+// credentials grant. The secret is returned only once.
+func (s *Server) createMachineUser(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if !usernamePattern.MatchString(body.Name) {
+		fail(w, r, validationError("name must be 1-64 ASCII letters, digits, '.', '_' or '-'"))
+		return
+	}
+	orgID := chi.URLParam(r, "orgID")
+	if err := s.checkQuota(r, store.QuotaUsersPerOrg, orgID); err != nil {
+		fail(w, r, err)
+		return
+	}
+	clientID, clientSecret := "m_"+secret.Token(16), secret.Token(32)
+	hash, err := s.authn.HashSecret(clientSecret)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	user, err := s.store.CreateMachineUser(r.Context(), orgID, body.Name, clientID, hash)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, orgID, "machine_user.created", "user:"+user.ID, map[string]any{"name": user.Username})
+	writeJSON(w, http.StatusCreated, struct {
+		*store.User
+		ClientSecret string `json:"client_secret"`
+	}{user, clientSecret})
+}
+
+// rotateClientSecret issues a new secret for a machine user; the old one stops working.
+func (s *Server) rotateClientSecret(w http.ResponseWriter, r *http.Request) {
+	user, err := s.userForCaller(r, chi.URLParam(r, "userID"))
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	if user.Kind != store.KindMachine {
+		fail(w, r, validationError("only machine users have a client secret"))
+		return
+	}
+	clientSecret := secret.Token(32)
+	hash, err := s.authn.HashSecret(clientSecret)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := s.store.SetClientSecret(r.Context(), user.ID, hash); err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := s.store.RevokeUserTokens(r.Context(), user.ID); err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, user.OrgID, "machine_user.secret_rotated", "user:"+user.ID, nil)
+	writeJSON(w, http.StatusOK, map[string]string{"client_id": *user.ClientID, "client_secret": clientSecret})
+}
+
+// --- passkey registration ------------------------------------------------------------------
+
+func (s *Server) beginPasskeyRegistration(w http.ResponseWriter, r *http.Request) {
+	user, err := s.userForCaller(r, chi.URLParam(r, "userID"))
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := humanOnly(user); err != nil {
+		fail(w, r, err)
+		return
+	}
+	options, err := s.authn.BeginPasskeyRegistration(r.Context(), user)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, options)
+}
+
+func (s *Server) finishPasskeyRegistration(w http.ResponseWriter, r *http.Request) {
+	user, err := s.userForCaller(r, chi.URLParam(r, "userID"))
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	var body struct {
+		Name       string          `json:"name"`
+		Credential json.RawMessage `json:"credential"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	key, err := s.authn.FinishPasskeyRegistration(r.Context(), user, body.Name, body.Credential)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, user.OrgID, "user.passkey_added", "user:"+user.ID, map[string]any{"credential_id": key.ID})
+	writeJSON(w, http.StatusCreated, key)
+}
+
+func (s *Server) listPasskeys(w http.ResponseWriter, r *http.Request) {
+	user, err := s.userForCaller(r, chi.URLParam(r, "userID"))
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	keys, err := s.store.ListPasskeys(r.Context(), user.ID)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, keys)
+}
+
+func (s *Server) deletePasskey(w http.ResponseWriter, r *http.Request) {
+	user, err := s.userForCaller(r, chi.URLParam(r, "userID"))
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := s.store.DeletePasskey(r.Context(), user.ID, chi.URLParam(r, "credentialID")); err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := s.store.DeleteUserSessions(r.Context(), user.ID); err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, user.OrgID, "user.passkey_removed", "user:"+user.ID, map[string]any{"credential_id": chi.URLParam(r, "credentialID")})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// humanOnly rejects operations that make no sense for machine users.
+func humanOnly(user *store.User) error {
+	if user.Kind != store.KindHuman {
+		return validationError("not available for machine users")
+	}
+	return nil
 }

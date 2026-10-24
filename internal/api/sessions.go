@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -136,4 +137,147 @@ func (s *Server) finalizeAuthRequest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"callback_url": oidcop.CallbackURL(s.provider, s.issuer, id),
 	})
+}
+
+// --- password reset ------------------------------------------------------------------------
+
+// startPasswordReset returns a reset token for the login backend to email to
+// the user. For unknown login names it returns 202 with no token, so the
+// backend can show the same "check your inbox" message either way.
+func (s *Server) startPasswordReset(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Org       string `json:"org"`
+		LoginName string `json:"login_name"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	p := principalFrom(r.Context())
+	org, err := s.store.GetOrgByRef(r.Context(), body.Org)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		fail(w, r, err)
+		return
+	}
+	if err != nil || !p.canAccessOrg(org.ID) {
+		if p.isAdmin() {
+			fail(w, r, validationError("unknown org"))
+		} else {
+			fail(w, r, errForbidden)
+		}
+		return
+	}
+	reset, err := s.authn.StartPasswordReset(r.Context(), loginClient(r), org.ID, body.LoginName)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	if reset == nil {
+		writeJSON(w, http.StatusAccepted, map[string]any{})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, reset)
+}
+
+func (s *Server) confirmPasswordReset(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token    string `json:"token"`
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if err := s.authn.ConfirmPasswordReset(r.Context(), loginClient(r), body.Token, body.Password); err != nil {
+		fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- federated login (per-org SSO) -----------------------------------------------------------
+
+func (s *Server) startFederatedLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Org       string `json:"org"`
+		IDPID     string `json:"idp_id"`
+		ReturnURL string `json:"return_url"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	p := principalFrom(r.Context())
+	org, err := s.store.GetOrgByRef(r.Context(), body.Org)
+	if err != nil || !p.canAccessOrg(org.ID) {
+		fail(w, r, errForbidden)
+		return
+	}
+	if !redirectURLAllowed(body.ReturnURL, false, s.devMode) {
+		fail(w, r, validationError("return_url must be an https URL of your login UI"))
+		return
+	}
+	start, err := s.authn.StartFederatedLogin(r.Context(), org.ID, body.IDPID, body.ReturnURL)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, start)
+}
+
+func (s *Server) redeemFederatedLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	state, err := s.authn.RedeemFederatedLogin(r.Context(), loginClient(r), chi.URLParam(r, "intentID"), body.Code)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, state)
+}
+
+// IDPCallback is where external identity providers send the browser back.
+// It is public: the one-time state parameter authenticates the request.
+func (s *Server) IDPCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	target, err := s.authn.HandleCallback(r.Context(), q.Get("state"), q.Get("code"), q.Get("error"))
+	if err != nil {
+		http.Error(w, "invalid or expired login attempt", http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, target, http.StatusFound)
+}
+
+// --- passkey login --------------------------------------------------------------------------
+
+func (s *Server) beginPasskeyLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionToken string `json:"session_token"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	options, err := s.authn.BeginPasskeyLogin(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, options)
+}
+
+func (s *Server) finishPasskeyLogin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionToken string          `json:"session_token"`
+		Credential   json.RawMessage `json:"credential"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	state, err := s.authn.FinishPasskeyLogin(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken, body.Credential)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
 }

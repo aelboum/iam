@@ -149,6 +149,9 @@ func (s *Storage) DeleteAuthRequest(ctx context.Context, id string) error {
 // --- tokens ------------------------------------------------------------------------------
 
 func (s *Storage) CreateAccessToken(ctx context.Context, req op.TokenRequest) (string, time.Time, error) {
+	if jr, ok := req.(*oidc.JWTTokenRequest); ok {
+		return s.machineAccessToken(ctx, jr) // client credentials grant
+	}
 	ar, ok := req.(*authRequest)
 	if !ok {
 		return "", time.Time{}, fmt.Errorf("unsupported token request %T", req)
@@ -264,6 +267,14 @@ func (s *Storage) TokenRequestByRefreshToken(ctx context.Context, refreshToken s
 }
 
 func (s *Storage) checkUserCanUseClient(ctx context.Context, userID, clientID string) error {
+	app, err := s.store.GetAppByClientID(ctx, clientID)
+	if err != nil {
+		return errors.New("client not found")
+	}
+	return s.checkUserCanUseProject(ctx, userID, app.ProjectID)
+}
+
+func (s *Storage) checkUserCanUseProject(ctx context.Context, userID, projectID string) error {
 	user, err := s.store.GetUser(ctx, userID)
 	if err != nil {
 		return errors.New("user not found")
@@ -273,11 +284,10 @@ func (s *Storage) checkUserCanUseClient(ctx context.Context, userID, clientID st
 	if user.Locked {
 		return authn.ErrLocked
 	}
-	app, err := s.store.GetAppByClientID(ctx, clientID)
-	if err != nil {
-		return errors.New("client not found")
+	if projectID == "" {
+		return nil // machine token without a project: org claims only
 	}
-	if _, ok, err := s.store.AvailableRoles(ctx, app.ProjectID, user.OrgID); err != nil {
+	if _, ok, err := s.store.AvailableRoles(ctx, projectID, user.OrgID); err != nil {
 		return err
 	} else if !ok {
 		return authn.ErrNoAccess
@@ -408,12 +418,12 @@ func (s *Storage) SetIntrospectionFromToken(ctx context.Context, resp *oidc.Intr
 	if err != nil {
 		return errors.New("client not found")
 	}
-	issuedTo, err := s.store.GetAppByClientID(ctx, t.ClientID)
-	if err != nil || issuedTo.ProjectID != caller.ProjectID {
+	tokenProject, err := s.tokenProject(ctx, t.ClientID, t.Scopes)
+	if err != nil || tokenProject != caller.ProjectID {
 		return errors.New("token is not valid for this client")
 	}
 	// Report locked users and revoked grants as inactive immediately.
-	if err := s.checkUserCanUseClient(ctx, t.Subject, t.ClientID); err != nil {
+	if err := s.checkUserCanUseProject(ctx, t.Subject, tokenProject); err != nil {
 		return err
 	}
 	info := new(oidc.UserInfo)
@@ -429,7 +439,7 @@ func (s *Storage) SetIntrospectionFromToken(ctx context.Context, resp *oidc.Intr
 
 // GetPrivateClaimsFromScopes adds the tenant claims to JWT access tokens.
 func (s *Storage) GetPrivateClaimsFromScopes(ctx context.Context, userID, clientID string, scopes []string) (map[string]any, error) {
-	return s.tenantClaims(ctx, userID, clientID)
+	return s.tenantClaims(ctx, userID, clientID, scopes)
 }
 
 func (s *Storage) GetPrivateClaimsFromRequest(ctx context.Context, req op.TokenRequest, restrictedScopes []string) (map[string]any, error) {
@@ -439,8 +449,12 @@ func (s *Storage) GetPrivateClaimsFromRequest(ctx context.Context, req op.TokenR
 		clientID = r.GetClientID()
 	case *refreshTokenRequest:
 		clientID = r.GetClientID()
+	case *oidc.JWTTokenRequest:
+		if len(r.Audience) > 0 {
+			clientID = r.Audience[0]
+		}
 	}
-	return s.tenantClaims(ctx, req.GetSubject(), clientID)
+	return s.tenantClaims(ctx, req.GetSubject(), clientID, req.GetScopes())
 }
 
 func (s *Storage) GetKeyByIDAndClientID(context.Context, string, string) (*jose.JSONWebKey, error) {
@@ -475,7 +489,7 @@ func (s *Storage) setUserinfo(ctx context.Context, info *oidc.UserInfo, userID, 
 			info.UpdatedAt = oidc.FromTime(user.UpdatedAt)
 		}
 	}
-	claims, err := s.tenantClaims(ctx, userID, clientID)
+	claims, err := s.tenantClaims(ctx, userID, clientID, scopes)
 	if err != nil {
 		return err
 	}
@@ -487,7 +501,7 @@ func (s *Storage) setUserinfo(ctx context.Context, info *oidc.UserInfo, userID, 
 
 // tenantClaims are the B2B2C claims a SaaS needs to authorize a request:
 // which org the user belongs to and which roles they hold in this project.
-func (s *Storage) tenantClaims(ctx context.Context, userID, clientID string) (map[string]any, error) {
+func (s *Storage) tenantClaims(ctx context.Context, userID, clientID string, scopes []string) (map[string]any, error) {
 	user, err := s.store.GetUser(ctx, userID)
 	if err != nil {
 		return nil, errors.New("user not found")
@@ -503,15 +517,18 @@ func (s *Storage) tenantClaims(ctx context.Context, userID, clientID string) (ma
 	if clientID == "" {
 		return claims, nil
 	}
-	app, err := s.store.GetAppByClientID(ctx, clientID)
+	projectID, err := s.tokenProject(ctx, clientID, scopes)
 	if err != nil {
 		return nil, err
 	}
-	roles, err := s.store.EffectiveRoles(ctx, user, app.ProjectID)
+	if projectID == "" {
+		return claims, nil // machine token without a project scope
+	}
+	roles, err := s.store.EffectiveRoles(ctx, user, projectID)
 	if err != nil {
 		return nil, err
 	}
-	claims["project_id"] = app.ProjectID
+	claims["project_id"] = projectID
 	claims["roles"] = roles
 	return claims, nil
 }
@@ -525,4 +542,73 @@ func joinName(given, family string) string {
 	default:
 		return given + " " + family
 	}
+}
+
+// --- machine users (client credentials grant) ----------------------------------------------------
+
+var _ op.ClientCredentialsStorage = (*Storage)(nil)
+
+// ClientCredentials authenticates a machine user by client id and secret.
+func (s *Storage) ClientCredentials(ctx context.Context, clientID, clientSecret string) (op.Client, error) {
+	user, err := s.store.GetMachineUserByClientID(ctx, clientID)
+	if err != nil || user.ClientSecretHash == nil || !s.authn.VerifySecret(*user.ClientSecretHash, clientSecret) {
+		return nil, oidc.ErrInvalidClient().WithDescription("invalid client credentials")
+	}
+	if user.Locked {
+		return nil, oidc.ErrInvalidClient().WithDescription("machine user is locked")
+	}
+	return &machineClient{user}, nil
+}
+
+func (s *Storage) ClientCredentialsTokenRequest(ctx context.Context, clientID string, scopes []string) (op.TokenRequest, error) {
+	user, err := s.store.GetMachineUserByClientID(ctx, clientID)
+	if err != nil {
+		return nil, oidc.ErrInvalidClient()
+	}
+	// A project scope is only honoured if the machine user's org can use the project.
+	if projectID := projectFromScopes(scopes); projectID != "" {
+		if _, allowed, err := s.store.AvailableRoles(ctx, projectID, user.OrgID); err != nil || !allowed {
+			return nil, oidc.ErrInvalidScope().WithDescription("no access to the requested project")
+		}
+	}
+	return &oidc.JWTTokenRequest{
+		Subject:  user.ID,
+		Audience: []string{clientID},
+		Scopes:   scopes,
+		IssuedAt: oidc.FromTime(time.Now()),
+	}, nil
+}
+
+// machineAccessToken stores the access token for a client credentials request.
+func (s *Storage) machineAccessToken(ctx context.Context, req *oidc.JWTTokenRequest) (string, time.Time, error) {
+	if len(req.Audience) == 0 {
+		return "", time.Time{}, errors.New("missing audience")
+	}
+	at := &store.AccessToken{
+		ID:        uuid.NewString(),
+		ClientID:  req.Audience[0],
+		Subject:   req.Subject,
+		Audience:  req.Audience,
+		Scopes:    req.Scopes,
+		ExpiresAt: time.Now().Add(s.cfg.AccessToken),
+	}
+	if at.Scopes == nil {
+		at.Scopes = []string{}
+	}
+	if err := s.store.CreateTokens(ctx, at, nil); err != nil {
+		return "", time.Time{}, err
+	}
+	return at.ID, at.ExpiresAt, nil
+}
+
+// tokenProject resolves which project a token is for: the app's project for
+// app tokens, or the project scope of a machine token.
+func (s *Storage) tokenProject(ctx context.Context, clientID string, scopes []string) (string, error) {
+	if app, err := s.store.GetAppByClientID(ctx, clientID); err == nil {
+		return app.ProjectID, nil
+	}
+	if _, err := s.store.GetMachineUserByClientID(ctx, clientID); err == nil {
+		return projectFromScopes(scopes), nil
+	}
+	return "", errors.New("client not found")
 }

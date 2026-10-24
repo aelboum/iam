@@ -42,37 +42,58 @@ func Equal(a, b string) bool {
 }
 
 // Box encrypts and decrypts values with AES-256-GCM.
+// It seals with the first key and opens with any of them, so the master key
+// can be rotated: deploy the new key first with the old one as a fallback,
+// re-encrypt (iamd rotate-keys), then drop the old key.
 type Box struct {
-	aead cipher.AEAD
+	aeads []cipher.AEAD
 }
 
-func NewBox(key [32]byte) *Box {
-	block, err := aes.NewCipher(key[:])
-	if err != nil {
-		panic(err) // only fails for invalid key sizes
+func NewBox(key [32]byte, previous ...[32]byte) *Box {
+	b := &Box{}
+	for _, k := range append([][32]byte{key}, previous...) {
+		block, err := aes.NewCipher(k[:])
+		if err != nil {
+			panic(err) // only fails for invalid key sizes
+		}
+		aead, err := cipher.NewGCM(block)
+		if err != nil {
+			panic(err)
+		}
+		b.aeads = append(b.aeads, aead)
 	}
-	aead, err := cipher.NewGCM(block)
-	if err != nil {
-		panic(err)
-	}
-	return &Box{aead: aead}
+	return b
 }
 
-// Seal returns nonce || ciphertext.
+// Seal returns nonce || ciphertext, encrypted with the current key.
 func (b *Box) Seal(plaintext []byte) []byte {
-	nonce := make([]byte, b.aead.NonceSize())
+	aead := b.aeads[0]
+	nonce := make([]byte, aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		panic(err)
 	}
-	return b.aead.Seal(nonce, nonce, plaintext, nil)
+	return aead.Seal(nonce, nonce, plaintext, nil)
 }
 
+// Open decrypts with the current key or, failing that, a previous one.
 func (b *Box) Open(sealed []byte) ([]byte, error) {
-	n := b.aead.NonceSize()
-	if len(sealed) < n {
-		return nil, errors.New("secret: ciphertext too short")
+	plain, _, err := b.OpenCurrent(sealed)
+	return plain, err
+}
+
+// OpenCurrent also reports whether sealed used the current key; false means
+// it should be re-encrypted.
+func (b *Box) OpenCurrent(sealed []byte) (plain []byte, current bool, err error) {
+	for i, aead := range b.aeads {
+		n := aead.NonceSize()
+		if len(sealed) < n {
+			return nil, false, errors.New("secret: ciphertext too short")
+		}
+		if plain, err := aead.Open(nil, sealed[:n], sealed[n:], nil); err == nil {
+			return plain, i == 0, nil
+		}
 	}
-	return b.aead.Open(nil, sealed[:n], sealed[n:], nil)
+	return nil, false, errors.New("secret: cannot decrypt with any configured key")
 }
 
 // Derive returns a sub-key bound to a purpose label.

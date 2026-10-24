@@ -24,29 +24,30 @@ import (
 
 type Server struct {
 	store    *store.Store
+	box      *secret.Box
 	authn    *authn.Service
 	provider *op.Provider
 	issuer   string
 	// devMode allows apps with dev_mode (plain-http redirect URIs).
 	devMode bool
 	// loginIPLimit caps session API calls per end-user IP.
-	loginIPLimit *ratelimit.Limiter
+	loginIPLimit ratelimit.Allower
 	// loginKeyLimit caps session API calls per API key, so a leaked key that
 	// forges X-End-User-IP still cannot flood the engine.
-	loginKeyLimit *ratelimit.Limiter
+	loginKeyLimit ratelimit.Allower
 	// mgmtKeyLimit caps management API calls per API key.
-	mgmtKeyLimit *ratelimit.Limiter
+	mgmtKeyLimit ratelimit.Allower
 	// authFailLimit caps invalid API key attempts per connecting address.
-	authFailLimit *ratelimit.Limiter
+	authFailLimit ratelimit.Allower
 }
 
-func NewServer(st *store.Store, an *authn.Service, provider *op.Provider, issuer string, devMode bool) *Server {
+func NewServer(st *store.Store, box *secret.Box, an *authn.Service, provider *op.Provider, issuer string, devMode bool, limits ratelimit.Factory) *Server {
 	return &Server{
-		store: st, authn: an, provider: provider, issuer: issuer, devMode: devMode,
-		loginIPLimit:  ratelimit.New(30, 20),
-		loginKeyLimit: ratelimit.New(1200, 300),
-		mgmtKeyLimit:  ratelimit.New(600, 120),
-		authFailLimit: ratelimit.New(30, 30),
+		store: st, box: box, authn: an, provider: provider, issuer: issuer, devMode: devMode,
+		loginIPLimit:  limits("login-ip", 30, 20),
+		loginKeyLimit: limits("login-key", 1200, 300),
+		mgmtKeyLimit:  limits("mgmt-key", 600, 120),
+		authFailLimit: limits("auth-fail", 30, 30),
 	}
 }
 
@@ -64,8 +65,14 @@ func (s *Server) Routes() http.Handler {
 			r.Delete("/", s.deleteSession)
 			r.Post("/password", s.checkPassword)
 			r.Post("/totp", s.checkTOTP)
+			r.Post("/passkey/begin", s.beginPasskeyLogin)
+			r.Post("/passkey/finish", s.finishPasskeyLogin)
 		})
 		r.Get("/auth-requests/{authRequestID}", s.getAuthRequest)
+		r.Post("/password-resets", s.startPasswordReset)
+		r.Post("/federated-logins", s.startFederatedLogin)
+		r.Post("/federated-logins/{intentID}/redeem", s.redeemFederatedLogin)
+		r.Post("/password-resets/confirm", s.confirmPasswordReset)
 		r.Post("/auth-requests/{authRequestID}/finalize", s.finalizeAuthRequest)
 	})
 
@@ -90,6 +97,10 @@ func (s *Server) Routes() http.Handler {
 				r.Delete("/api-keys/{keyID}", s.deleteAPIKey)
 				r.Get("/audit", s.listOrgAudit)
 				r.Post("/users", s.createUser)
+				r.Post("/machine-users", s.createMachineUser)
+				r.Post("/idps", s.createIDP)
+				r.Get("/idps", s.listIDPs)
+				r.Delete("/idps/{idpID}", s.deleteIDP)
 				r.Get("/users", s.listUsers)
 				r.Post("/projects", s.createProject)
 				r.Get("/projects", s.listProjects)
@@ -102,6 +113,11 @@ func (s *Server) Routes() http.Handler {
 			r.Patch("/", s.updateUser)
 			r.Delete("/", s.deleteUser)
 			r.Put("/password", s.setPassword)
+			r.Post("/client-secret", s.rotateClientSecret)
+			r.Post("/passkeys/registration", s.beginPasskeyRegistration)
+			r.Post("/passkeys/registration/finish", s.finishPasskeyRegistration)
+			r.Get("/passkeys", s.listPasskeys)
+			r.Delete("/passkeys/{credentialID}", s.deletePasskey)
 			r.Post("/lock", s.lockUser)
 			r.Post("/unlock", s.unlockUser)
 			r.Post("/logout", s.logoutUser)
@@ -387,6 +403,7 @@ var quotaLimits = map[store.Quota]int{
 	store.QuotaKeysPerOrg:      50,
 	store.QuotaAppsPerProject:  50,
 	store.QuotaRolesPerProject: 200,
+	store.QuotaIDPsPerOrg:      10,
 }
 
 var errQuota = errors.New("quota exceeded")

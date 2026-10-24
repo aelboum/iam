@@ -442,7 +442,7 @@ def main():
     # Per-IP rate limit on the login API.
     statuses = [http("POST", "/v1/sessions", {"org": acme["slug"], "login_name": "x"},
                      {"Authorization": "Bearer " + login_key, "X-End-User-IP": "203.0.113.7"})[0]
-                for _ in range(25)]
+                for _ in range(40)]
     check(429 in statuses and statuses[0] == 201, "login API rate-limited per end-user IP")
 
     # Existence oracle: an unrelated org cannot tell a foreign project from a missing one.

@@ -35,6 +35,13 @@ func main() {
 		os.Exit(healthcheck())
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	if len(os.Args) > 1 && os.Args[1] == "rotate-keys" {
+		if err := rotateKeys(); err != nil {
+			slog.Error("rotate-keys failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "error", err)
 		os.Exit(1)
@@ -59,7 +66,7 @@ func run() error {
 	}
 
 	st := store.New(pool)
-	box := secret.NewBox(secret.Derive(cfg.MasterKey, "at-rest-encryption"))
+	box := atRestBox(cfg)
 
 	if cfg.BootstrapAdminKey != "" {
 		created, err := st.BootstrapAPIKey(ctx, "bootstrap admin", secret.Hash(cfg.BootstrapAdminKey))
@@ -75,7 +82,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Shared limits count across all instances; in-memory limits per instance.
+	limits := ratelimit.Factory(ratelimit.Memory)
+	if cfg.SharedRateLimits {
+		limits = func(name string, perMinute float64, burst int) ratelimit.Allower {
+			return st.NewPGLimiter(name, perMinute, burst)
+		}
+	}
+	webAuthn, err := authn.NewWebAuthn(cfg.WebAuthnRPID, issuerURL.Host, cfg.WebAuthnOrigins)
+	if err != nil {
+		return err
+	}
 	an := authn.NewService(st, box, authn.Config{
+		Limits:          limits,
+		Issuer:          cfg.Issuer,
+		DevMode:         cfg.DevMode,
+		WebAuthn:        webAuthn,
 		IssuerName:      issuerURL.Host,
 		SessionLifetime: cfg.LoginLifetime,
 		MaxFailedLogins: cfg.MaxFailedLogins,
@@ -92,14 +114,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	apiServer := api.NewServer(st, an, provider, cfg.Issuer, cfg.DevMode)
+	apiServer := api.NewServer(st, box, an, provider, cfg.Issuer, cfg.DevMode, limits)
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
 	if cfg.TrustProxy {
 		router.Use(forwardedFor(cfg.ProxyHops))
 	}
-	router.Use(middleware.Recoverer, securityHeaders, limitOAuthEndpoints())
+	router.Use(middleware.Recoverer, securityHeaders, limitOAuthEndpoints(limits))
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
@@ -111,6 +133,7 @@ func run() error {
 		w.Write([]byte("signed out"))
 	})
 	router.Mount("/v1", apiServer.Routes())
+	router.Get(authn.CallbackPath, apiServer.IDPCallback)
 	if cfg.EnableDocs {
 		docs.Register(router)
 	}
@@ -191,6 +214,48 @@ func healthcheck() int {
 	return 0
 }
 
+// atRestBox encrypts with the current master key and still decrypts data
+// sealed with any IAM_MASTER_KEY_PREVIOUS key.
+func atRestBox(cfg *config.Config) *secret.Box {
+	var previous [][32]byte
+	for _, k := range cfg.PreviousMasterKeys {
+		previous = append(previous, secret.Derive(k, "at-rest-encryption"))
+	}
+	return secret.NewBox(secret.Derive(cfg.MasterKey, "at-rest-encryption"), previous...)
+}
+
+// rotateKeys re-encrypts all stored secrets with the current master key.
+// Run it after deploying a new IAM_MASTER_KEY with the old one in
+// IAM_MASTER_KEY_PREVIOUS; afterwards the old key can be removed.
+func rotateKeys() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := db.Migrate(ctx, pool); err != nil {
+		return err
+	}
+	box := atRestBox(cfg)
+	n, err := store.New(pool).Reencrypt(ctx, func(sealed []byte) ([]byte, bool, error) {
+		plain, current, err := box.OpenCurrent(sealed)
+		if err != nil || current {
+			return nil, false, err
+		}
+		return box.Seal(plain), true, nil
+	})
+	if err != nil {
+		return err
+	}
+	slog.Info("re-encrypted secrets with the current master key", "values", n)
+	return nil
+}
+
 // securityHeaders sets defensive headers on every response.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -207,11 +272,11 @@ func securityHeaders(next http.Handler) http.Handler {
 
 // limitOAuthEndpoints rate-limits the token, introspection and revocation
 // endpoints per client IP, which slows client secret and code guessing.
-func limitOAuthEndpoints() func(http.Handler) http.Handler {
-	limiter := ratelimit.New(120, 60)
+func limitOAuthEndpoints(limits ratelimit.Factory) func(http.Handler) http.Handler {
+	limiter := limits("oauth", 120, 60)
 	// /authorize stores a pending request per call, so it is limited too.
-	authorizeLimiter := ratelimit.New(60, 30)
-	limited := map[string]*ratelimit.Limiter{
+	authorizeLimiter := limits("authorize", 60, 30)
+	limited := map[string]ratelimit.Allower{
 		"/oauth/token": limiter, "/oauth/introspect": limiter, "/revoke": limiter,
 		"/authorize": authorizeLimiter, "/authorize/callback": authorizeLimiter,
 	}
@@ -243,6 +308,9 @@ func purgeLoop(ctx context.Context, st *store.Store, auditRetention time.Duratio
 		}
 		if err := st.PurgeAudit(ctx, auditRetention); err != nil && ctx.Err() == nil {
 			slog.Error("purge audit", "error", err)
+		}
+		if err := st.PurgeRateLimits(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("purge rate limits", "error", err)
 		}
 		select {
 		case <-ctx.Done():

@@ -39,6 +39,10 @@ services:
       IAM_ENABLE_DOCS: "false"
       IAM_TRUST_PROXY: "true"
       IAM_TRUSTED_PROXY_HOPS: "1"
+      IAM_SHARED_RATE_LIMITS: "true"
+      IAM_MASTER_KEY_PREVIOUS: ${IAM_MASTER_KEY_PREVIOUS:-}
+      IAM_WEBAUTHN_RP_ID: ${IAM_WEBAUTHN_RP_ID:-}
+      IAM_WEBAUTHN_ORIGINS: ${IAM_WEBAUTHN_ORIGINS:-}
     # No published ports: only Caddy can reach the engine.
     expose: ["8080"]
     read_only: true
