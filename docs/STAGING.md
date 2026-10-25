@@ -75,6 +75,25 @@ Set on the staging engine, and confirm each at boot:
    backup tooling (not just the rehearsal script), restored to an isolated
    target and validated before any reuse.
 
+## Rollback and recovery criteria (rehearse before relying on them)
+
+Decide and prove these in staging, not during a production incident:
+
+- **Abort criteria.** Stop the rollout and investigate if: the engine fails to
+  start (migration error, invalid config, or WebAuthn-origin rejection), the
+  health check does not pass, `schema_migrations` is missing any migration, a
+  real login flow fails, or audit events stop being written.
+- **Binary rollback does not roll back schema.** Reverting to a previous engine
+  image does **not** undo schema changes already committed by 0006 or 0007, and
+  an older binary may not understand the newer schema. Decide binary and schema
+  recovery together (DEPLOYMENT.md § *Recovering from a failed migration*).
+- **Restore to an isolated target first.** If recovery needs a backup, restore
+  onto a separate database and validate schema and data there before directing
+  traffic to it; never restore an older snapshot over a live or newer database
+  without an approved recovery decision.
+- **Rehearse the restore** with the environment's real backup tooling (step 6),
+  and record the measured restore time so an incident has a known bound.
+
 ## Go / no-go
 
 Staging is complete for pre-production only when steps 1–4 pass with retained

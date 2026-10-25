@@ -88,20 +88,28 @@ start_pg() { # start_pg <name> -> waits until ready
   return 1
 }
 
-start_engine() { # start_engine <name> <pg_container> <host_port> -> waits until listening
+start_engine() { # start_engine <name> <pg_container> -> waits until listening
   local name="iam-${RUN}-$1"
   RESOURCES+=("$name")
-  docker run -d --name "$name" --network "$NET" -p "127.0.0.1:$3:8080" \
+  # Bind to an ephemeral loopback port (not a fixed one) so re-runs and
+  # concurrent runs never collide on a host port.
+  docker run -d --name "$name" --network "$NET" -p "127.0.0.1:0:8080" \
     -e IAM_ISSUER=http://localhost:8080 \
     -e IAM_DEV_MODE=true \
     -e IAM_DATABASE_URL="postgres://iam:iam@$2:5432/iam?sslmode=disable" \
     -e IAM_MASTER_KEY="$MASTER_KEY" \
     -e IAM_BOOTSTRAP_ADMIN_KEY="$ADMIN_KEY" \
     "$IMAGE" >/dev/null
+  local hostport
+  hostport="$(docker port "$name" 8080/tcp | head -1 | sed 's/.*://')"
+  if [ -z "$hostport" ]; then
+    echo "could not determine published port for $name" >&2
+    return 1
+  fi
   # Migrations run before the listener opens, so a reachable port proves the
   # migrate step completed. Any HTTP status (the engine 404s "/") counts.
   for _ in $(seq 1 60); do
-    if curl -s -o /dev/null -m 2 "http://127.0.0.1:$3/"; then
+    if curl -s -o /dev/null -m 2 "http://127.0.0.1:${hostport}/"; then
       echo "$name"; return 0
     fi
     if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ]; then
@@ -122,7 +130,7 @@ docker network create "$NET" >/dev/null
 log "A. FRESH INSTALL applies all $MIG_COUNT migrations in order"
 ############################################################################
 PG_A="$(start_pg pg-fresh)"
-ENG_A="$(start_engine eng-fresh "$PG_A" 18080)"
+ENG_A="$(start_engine eng-fresh "$PG_A")"
 COUNT_A="$(psql_q "$PG_A" 'SELECT count(*) FROM schema_migrations;')"
 [ "$COUNT_A" = "$MIG_COUNT" ] \
   && pass "schema_migrations has all $MIG_COUNT versions after fresh install" \
@@ -157,7 +165,7 @@ ORG_B="$(psql_q "$PG_B" "SELECT count(*) FROM orgs WHERE id='$ORG_ID';")"
 [ "$ORG_B" = "1" ] && pass "seeded org row present on restored target" || fail "seeded org row missing after restore"
 # Validate the restored target by pointing a fresh engine at it: it must apply
 # zero new migrations and become reachable.
-ENG_B="$(start_engine eng-restore "$PG_B" 18081)"
+ENG_B="$(start_engine eng-restore "$PG_B")"
 COUNT_B2="$(psql_q "$PG_B" 'SELECT count(*) FROM schema_migrations;')"
 [ "$COUNT_B2" = "$MIG_COUNT" ] \
   && pass "engine against restored target applied zero further migrations (still $MIG_COUNT)" \
@@ -192,7 +200,7 @@ docker exec "$PG_C" psql -U iam -d iam -q -v ON_ERROR_STOP=1 \
 SEEDED_C="$(psql_q "$PG_C" "SELECT count(*) FROM identity_providers WHERE id='$IDP_ID';")"
 [ "$SEEDED_C" = "1" ] && pass "seeded a pre-0007 generic OIDC provider ($IDP_ID)" || fail "could not seed legacy provider"
 # Upgrade by starting the engine; it must apply exactly 0007.
-ENG_C="$(start_engine eng-upgrade "$PG_C" 18082)"
+ENG_C="$(start_engine eng-upgrade "$PG_C")"
 POST="$(psql_q "$PG_C" 'SELECT count(*) FROM schema_migrations;')"
 [ "$POST" = "$MIG_COUNT" ] \
   && pass "engine upgraded database to all $MIG_COUNT migrations" \

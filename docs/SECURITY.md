@@ -53,6 +53,13 @@ documentation annotation in this repository and could not be mapped; flagged
 rather than assumed.) The per-finding matrix with file/line evidence is in the
 post-push review notes and mirrored by the controls table above.
 
+A later independent adversarial re-review (2026-10-25) found no new exploitable
+defect and one Low PII-hygiene issue, now fixed: the federated-login refusal
+path logged the raw `resolveFederatedUser` error, which for a database
+unique-violation echoes the conflicting value (e.g. a user's email) into logs.
+The refusal now logs a coarse reason (`locked` / `no_account`) and, for an
+unexpected error, only its Go type — no user data (`authn/federation.go`).
+
 ## Residual-risk register
 
 | ID | Risk | Severity | Impact | Compensating control | Disposition / owner |

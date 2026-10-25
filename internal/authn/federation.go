@@ -187,9 +187,18 @@ func (s *Service) HandleCallback(ctx context.Context, state, code, idpError stri
 	}
 	user, err := s.resolveFederatedUser(ctx, idp, claims)
 	if err != nil {
-		slog.InfoContext(ctx, "federated login refused", "idp", idp.ID, "error", err)
-		if errors.Is(err, ErrLocked) {
+		// Never log the raw error: a database unique-violation echoes the
+		// conflicting value (e.g. the user's email) into the message. Log a
+		// coarse reason, and for an unexpected error only its Go type, which
+		// carries no user data.
+		switch {
+		case errors.Is(err, ErrLocked):
+			slog.InfoContext(ctx, "federated login refused", "idp", idp.ID, "reason", "locked")
 			return failed("locked")
+		case errors.Is(err, ErrNoAccount):
+			slog.InfoContext(ctx, "federated login refused", "idp", idp.ID, "reason", "no_account")
+		default:
+			slog.ErrorContext(ctx, "federated login refused", "idp", idp.ID, "reason", "internal", "error_type", fmt.Sprintf("%T", err))
 		}
 		return failed("no_account")
 	}
