@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aelboum/iam/internal/db"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -29,6 +30,12 @@ func TestScanEncryptedReadOnlyDoesNotPurge(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer pool.Close()
+	// The disposable test database may be empty; apply migrations so the schema
+	// this test relies on (signing_keys) exists. Migrate is idempotent, so it is
+	// a no-op when the database is already migrated.
+	if err := db.Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate test database: %v", err)
+	}
 	st := New(pool)
 
 	id := "check-test-" + uuid.NewString()
