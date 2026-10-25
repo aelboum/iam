@@ -138,9 +138,13 @@ Other ways to authenticate the session in step 3:
   synced passkeys). The options never list credential IDs. Users register passkeys with
   `POST /v1/users/{id}/passkeys/registration` (+ `/finish`). Set `IAM_WEBAUTHN_RP_ID`
   and `IAM_WEBAUTHN_ORIGINS` to your login UI's domain and origin.
-- **SSO with the org's own IdP:**
+- **SSO with the org's own IdP (incl. Google and Microsoft):**
   - An org admin adds an OpenID Connect provider (`POST /v1/orgs/{id}/idps`) and
-    registers the returned `callback_url` at that IdP.
+    registers the returned `callback_url` at that IdP. `provider_type` selects a
+    preset — `google`, `microsoft` (personal accounts), `entra` (one Microsoft
+    directory; set `tenant` to its GUID), or `oidc` (generic, you supply `issuer`).
+    For a preset the engine pins the issuer, so Entra rejects other tenants.
+    See [docs/SOCIAL_LOGIN.md](docs/SOCIAL_LOGIN.md).
   - Login UI contract (prevents login CSRF): before starting, your login UI sets a
     cookie on its own origin with at least 32 random bytes (base64url), `HttpOnly`,
     `Secure`, `SameSite=Lax`, lifetime about 10 minutes. It sends that value as

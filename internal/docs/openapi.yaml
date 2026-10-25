@@ -632,18 +632,30 @@ paths:
     parameters: [{ $ref: "#/components/parameters/orgID" }]
     post:
       tags: [SSO]
-      summary: Add an OpenID Connect identity provider for the org ("bring your own SSO")
-      description: Register the returned `callback_url` as redirect URI at the IdP. Outside dev mode the issuer must be https and on a public address.
+      summary: Add an OpenID Connect identity provider for the org ("bring your own SSO", incl. Google/Microsoft)
+      description: |
+        Register the returned `callback_url` as redirect URI at the provider.
+        `provider_type` selects a preset:
+          - `oidc` (default): a generic provider; you supply `issuer` (https, public host).
+          - `google`: Google accounts; issuer is pinned to `https://accounts.google.com`.
+          - `microsoft`: Microsoft personal accounts (MSA) only; issuer pinned to the consumers tenant.
+          - `entra`: one Microsoft Entra ID directory; set `tenant` to the directory (tenant) GUID.
+        For a preset the engine pins and validates the issuer, so `issuer` must be omitted and
+        tokens from any other tenant/issuer are rejected. Outside dev mode a generic issuer must
+        be https and on a public address. Multi-tenant Microsoft (`common`/`organizations`) is not
+        supported in this release.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [name, issuer, client_id, client_secret]
+              required: [name, client_id, client_secret]
               properties:
-                name: { type: string, example: Okta }
-                issuer: { type: string, example: "https://acme.okta.com" }
+                name: { type: string, example: Google }
+                provider_type: { type: string, enum: [oidc, google, microsoft, entra], default: oidc }
+                tenant: { type: string, description: "Entra directory (tenant) GUID; only with provider_type=entra", example: "11112222-3333-4444-5555-666677778888" }
+                issuer: { type: string, description: "Generic (oidc) providers only; omit for presets", example: "https://acme.okta.com" }
                 client_id: { type: string }
                 client_secret: { type: string }
                 scopes: { type: array, items: { type: string }, default: [openid, profile, email] }

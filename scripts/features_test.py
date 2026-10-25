@@ -293,6 +293,42 @@ def main():
                             {"Authorization": "Bearer " + key})
         check(status == 400, f"invalid email domain allowlist {domains} refused")
 
+    # --- provider presets: Google, Microsoft personal, Entra -----------------------------------
+    # Creation stores config only (no network), so these are deterministic and need no live IdP.
+    creds = {"client_id": "preset-client", "client_secret": "preset-secret-value"}
+    google = api(key, "POST", f"/orgs/{acme['id']}/idps", {"name": "Google", "provider_type": "google", **creds})
+    check(google["issuer"] == "https://accounts.google.com" and google["provider_type"] == "google",
+          "google preset pins the Google issuer")
+    check("client_secret" not in json.dumps(google), "provider config read never includes the client secret")
+    msa = api(key, "POST", f"/orgs/{acme['id']}/idps", {"name": "MS personal", "provider_type": "microsoft", **creds})
+    check(msa["issuer"] == "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0",
+          "microsoft preset pins the personal-account (consumers) issuer")
+    tenant = "11112222-3333-4444-5555-666677778888"
+    entra = api(key, "POST", f"/orgs/{acme['id']}/idps",
+                {"name": "Entra", "provider_type": "entra", "tenant": tenant, **creds})
+    check(entra["issuer"] == f"https://login.microsoftonline.com/{tenant}/v2.0" and entra["tenant"] == tenant,
+          "entra preset pins the configured tenant issuer")
+    upper = api(key, "POST", f"/orgs/{acme['id']}/idps",
+                {"name": "Entra upper", "provider_type": "entra", "tenant": tenant.upper(), **creds})
+    check(upper["tenant"] == tenant and upper["issuer"] == f"https://login.microsoftonline.com/{tenant}/v2.0",
+          "entra tenant is stored lowercased to match the pinned issuer")
+    # Misconfigurations are refused.
+    for label, payload in [
+        ("unknown provider_type", {"name": "x", "provider_type": "azure", **creds}),
+        ("entra without tenant", {"name": "x", "provider_type": "entra", **creds}),
+        ("entra tenant not a GUID", {"name": "x", "provider_type": "entra", "tenant": "contoso.com", **creds}),
+        ("google with tenant", {"name": "x", "provider_type": "google", "tenant": tenant, **creds}),
+        ("preset with explicit issuer", {"name": "x", "provider_type": "google", "issuer": "https://evil.example", **creds}),
+        ("preset without client secret", {"name": "x", "provider_type": "google", "client_id": "c"}),
+    ]:
+        status, _, _ = http("POST", f"/v1/orgs/{acme['id']}/idps", payload, {"Authorization": "Bearer " + key})
+        check(status == 400, f"rejected: {label}")
+    # An org admin still cannot grant trust on a preset provider.
+    status, _, _ = http("POST", f"/v1/orgs/{acme['id']}/idps",
+                        {"name": "x", "provider_type": "google", "trust_email": True, **creds},
+                        {"Authorization": "Bearer " + acme_admin})
+    check(status == 400, "org admin cannot set trust_email on a preset provider")
+
     def browser_binding():
         return secrets.token_urlsafe(32)  # what the login UI keeps in an HttpOnly cookie
 

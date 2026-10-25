@@ -9,9 +9,15 @@ import (
 
 // IDP is an external OpenID Connect provider an org signs in with.
 type IDP struct {
-	ID              string   `json:"id"`
-	OrgID           string   `json:"org_id"`
-	Name            string   `json:"name"`
+	ID    string `json:"id"`
+	OrgID string `json:"org_id"`
+	Name  string `json:"name"`
+	// ProviderType is "oidc" (generic), "google", "microsoft" (personal MSA),
+	// or "entra" (one Microsoft Entra directory). For the presets the engine
+	// pins Issuer itself; for "oidc" the admin supplies it.
+	ProviderType string `json:"provider_type"`
+	// Tenant is the Entra directory (tenant) GUID; empty for other types.
+	Tenant          string   `json:"tenant,omitempty"`
 	Issuer          string   `json:"issuer"`
 	ClientID        string   `json:"client_id"`
 	ClientSecretEnc []byte   `json:"-"`
@@ -31,12 +37,12 @@ type IDP struct {
 	CreatedAt           time.Time `json:"created_at"`
 }
 
-const idpColumns = `id, org_id, name, issuer, client_id, client_secret_enc, scopes,
+const idpColumns = `id, org_id, name, provider_type, tenant, issuer, client_id, client_secret_enc, scopes,
 	auto_create_users, link_by_email, trust_email, trust_mfa, allowed_email_domains, created_at`
 
 func scanIDP(row interface{ Scan(...any) error }) (*IDP, error) {
 	var p IDP
-	if err := row.Scan(&p.ID, &p.OrgID, &p.Name, &p.Issuer, &p.ClientID, &p.ClientSecretEnc,
+	if err := row.Scan(&p.ID, &p.OrgID, &p.Name, &p.ProviderType, &p.Tenant, &p.Issuer, &p.ClientID, &p.ClientSecretEnc,
 		&p.Scopes, &p.AutoCreateUsers, &p.LinkByEmail, &p.TrustEmail, &p.TrustMFA, &p.AllowedEmailDomains, &p.CreatedAt); err != nil {
 		return nil, mapErr(err)
 	}
@@ -47,11 +53,14 @@ func (s *Store) CreateIDP(ctx context.Context, p IDP) (*IDP, error) {
 	if p.AllowedEmailDomains == nil {
 		p.AllowedEmailDomains = []string{}
 	}
+	if p.ProviderType == "" {
+		p.ProviderType = "oidc"
+	}
 	return scanIDP(s.pool.QueryRow(ctx, `
-		INSERT INTO identity_providers (id, org_id, name, issuer, client_id, client_secret_enc,
+		INSERT INTO identity_providers (id, org_id, name, provider_type, tenant, issuer, client_id, client_secret_enc,
 			scopes, auto_create_users, link_by_email, trust_email, trust_mfa, allowed_email_domains)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING `+idpColumns,
-		uuid.NewString(), p.OrgID, p.Name, p.Issuer, p.ClientID, p.ClientSecretEnc,
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING `+idpColumns,
+		uuid.NewString(), p.OrgID, p.Name, p.ProviderType, p.Tenant, p.Issuer, p.ClientID, p.ClientSecretEnc,
 		p.Scopes, p.AutoCreateUsers, p.LinkByEmail, p.TrustEmail, p.TrustMFA, p.AllowedEmailDomains))
 }
 

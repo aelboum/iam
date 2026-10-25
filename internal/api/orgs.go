@@ -227,7 +227,12 @@ func (s *Server) listOrgAudit(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name            string   `json:"name"`
+		Name string `json:"name"`
+		// ProviderType: "oidc" (default, generic), "google", "microsoft"
+		// (personal MSA), or "entra". For a preset the issuer is pinned by the
+		// engine and Issuer must be omitted; Tenant is the Entra directory GUID.
+		ProviderType    string   `json:"provider_type"`
+		Tenant          string   `json:"tenant"`
 		Issuer          string   `json:"issuer"`
 		ClientID        string   `json:"client_id"`
 		ClientSecret    string   `json:"client_secret"`
@@ -247,11 +252,40 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
-	// Plain http and private hosts are also refused at connect time outside dev mode.
-	issuer := strings.TrimRight(body.Issuer, "/")
-	if !redirectURLAllowed(issuer, false, s.devMode) {
-		fail(w, r, validationError("issuer must be an https URL"))
+	if body.ProviderType == "" {
+		body.ProviderType = authn.ProviderOIDC
+	}
+	if !authn.KnownProviderType(body.ProviderType) {
+		fail(w, r, validationError("provider_type must be one of: oidc, google, microsoft, entra"))
 		return
+	}
+	// Normalize the tenant once, so the stored value matches the pinned issuer
+	// (lowercased) and cannot be whitespace-padded.
+	body.Tenant = strings.ToLower(strings.TrimSpace(body.Tenant))
+	// Resolve the issuer. For a preset the engine pins it from the provider
+	// type and tenant, so an org admin cannot point the provider at an
+	// arbitrary issuer; for a generic provider the admin supplies it.
+	issuer := strings.TrimRight(body.Issuer, "/")
+	if body.ProviderType == authn.ProviderOIDC {
+		if body.Tenant != "" {
+			fail(w, r, validationError("tenant is only used with provider_type=entra"))
+			return
+		}
+		if !redirectURLAllowed(issuer, false, s.devMode) {
+			fail(w, r, validationError("issuer must be an https URL"))
+			return
+		}
+	} else {
+		if body.Issuer != "" {
+			fail(w, r, validationError("issuer is set automatically for this provider_type; omit it"))
+			return
+		}
+		pinned, err := authn.ProviderIssuer(body.ProviderType, body.Tenant)
+		if err != nil {
+			fail(w, r, validationError(err.Error()))
+			return
+		}
+		issuer = pinned
 	}
 	if (body.TrustEmail || body.TrustMFA) && !principalFrom(r.Context()).isAdmin() {
 		fail(w, r, validationError("only an instance admin can set trust_email or trust_mfa"))
@@ -270,9 +304,7 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, validationError("client_id and client_secret are required"))
 		return
 	}
-	if len(body.Scopes) == 0 {
-		body.Scopes = []string{"openid", "profile", "email"}
-	}
+	body.Scopes = authn.ProviderScopes(body.Scopes)
 	if err := validList("scopes", body.Scopes); err != nil {
 		fail(w, r, err)
 		return
@@ -282,7 +314,7 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	idp, err := s.store.CreateIDP(r.Context(), store.IDP{
-		OrgID: orgID, Name: body.Name,
+		OrgID: orgID, Name: body.Name, ProviderType: body.ProviderType, Tenant: body.Tenant,
 		Issuer: issuer, ClientID: body.ClientID,
 		ClientSecretEnc: s.box.Seal([]byte(body.ClientSecret)), Scopes: body.Scopes,
 		AutoCreateUsers: body.AutoCreateUsers, LinkByEmail: body.LinkByEmail,
@@ -292,7 +324,7 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
-	s.audit(r, orgID, "idp.created", "idp:"+idp.ID, map[string]any{"issuer": idp.Issuer})
+	s.audit(r, orgID, "idp.created", "idp:"+idp.ID, map[string]any{"issuer": idp.Issuer, "provider_type": idp.ProviderType})
 	writeJSON(w, http.StatusCreated, struct {
 		*store.IDP
 		CallbackURL string `json:"callback_url"`
