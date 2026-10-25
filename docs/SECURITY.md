@@ -70,6 +70,7 @@ unexpected error, only its Go type — no user data (`authn/federation.go`).
 | GO-2026-5932 | `golang.org/x/crypto/openpgp` advisory in a required module | Informational | None reachable — IAM does not call openpgp; `govulncheck` reports code affected by 0 | govulncheck gate in CI; no fix available upstream (Fixed: N/A) | **Accepted (unreachable)** — revisit if a dependency starts calling openpgp. Owner: maintainer. |
 | N4 | Entra accepts the MSA consumers GUID as a tenant | Informational | None — resolves to the real MSA directory (same as the `microsoft` preset) | Tenant-GUID validation; documented | **Accepted.** Owner: maintainer. |
 | N5 | Preset scopes are caller-supplied | Informational | None — upstream provider rejects unsupported scopes | `validList` validation | **Accepted.** Owner: maintainer. |
+| N6 | Generic-OIDC issuer has its trailing `/` trimmed (`api/orgs.go:268`) | Low (functional) | A provider whose canonical issuer ends in `/` (e.g. Auth0) fails `iss` strict-equality and login is refused — fails closed, no security impact; presets are unaffected (issuer pinned server-side) | Strict issuer equality is intentional; failure is closed, not a bypass | **Open — needs a live generic-OIDC provider that uses a trailing-slash issuer to verify any fix; not changed blind because it touches issuer equality.** Owner: maintainer. |
 
 Review this register whenever dependencies, migrations, or the trust model change.
 
