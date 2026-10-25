@@ -113,6 +113,90 @@ an existing deployment. Details are in the README and [openapi.yaml](../internal
   against your login UI's real origin in staging before deploying; a bad value
   fails fast at boot rather than breaking passkeys silently.
 
+### Expected one-time disruption from migration 0006
+
+Migration `0006_audit_remediation.sql` makes two changes that intentionally
+invalidate short-lived, in-flight security state. These are deliberate
+security-remediation consequences, **not** signs that the upgrade failed:
+
+1. It **drops and recreates the `password_resets` table**, so every
+   password-reset token outstanding at upgrade time stops working. Tokens live
+   at most 30 minutes, so the affected window is small.
+2. It adds the required browser-binding column to federation intents
+   (`ALTER TABLE idp_intents ADD COLUMN binding_hash text NOT NULL DEFAULT ''`).
+   Intents started before the upgrade carry an empty binding and **can no longer
+   be redeemed**, because redemption requires a non-empty binding that matches
+   the returning browser's cookie.
+
+After the upgrade, therefore:
+
+- Users who had requested a password reset must **request a new reset link**.
+- Users in the middle of an SSO / federated login must **start the login again**.
+- Existing user **passwords and already-completed sessions are not invalidated**
+  by these two changes. Migration 0006 adds columns to `sessions`
+  (`idp_trust_mfa`, `passkey_synced`) with safe defaults and does not touch
+  stored password hashes; source inspection of the migration confirms this.
+
+Plan the upgrade in a brief **maintenance window** and tell operators to expect
+this short-lived disruption to password-reset and federated-login flows.
+Draining in-flight requests before the upgrade reduces how many users are
+affected, but it does **not** remove the need for this warning: a reset token or
+login intent created just before the cutover is still invalidated.
+
+### Recovering from a failed migration
+
+The engine applies migrations automatically at startup: `Migrate` in
+[internal/db/db.go](../internal/db/db.go) runs every file under
+`internal/db/migrations/*.sql` not yet recorded in the `schema_migrations`
+table, in lexical order, **each inside its own transaction that also records the
+version**. There is **no automatic down-migration mechanism** in this
+repository; migrations only move forward.
+
+If a migration fails during an upgrade:
+
+1. **Stop or isolate the application instances** if your deployment's
+   consistency requires it, so no instance keeps retrying blindly against a
+   half-upgraded target.
+2. **Preserve the exact error and migration logs.** The engine returns
+   `apply <file>: <error>`; capture it rather than restarting in a loop.
+3. **Determine what actually committed.** Inspect the tracking table —
+   `SELECT version FROM schema_migrations ORDER BY version;` — and the relevant
+   schema. Because each migration commits atomically with its own
+   `schema_migrations` row, a version is present only if that migration fully
+   applied.
+4. **A failed migration rolls back its own changes** (its transaction aborts),
+   while every earlier, already-committed migration stays applied. The database
+   is left at the last fully-applied version, not in a half-applied state within
+   a single migration.
+5. **If the cause is correctable** (for example a transient resource limit), fix
+   the underlying issue, confirm the current `schema_migrations` state, and
+   **rerun the normal mechanism** — restart the engine, which re-applies only
+   the still-pending migrations.
+6. **If recovery requires a backup**, restore to an **isolated target first** and
+   validate schema and data there before directing any application traffic to
+   it. Backup tooling, restore commands, storage locations, and retention are
+   environment-specific and must come from your deployment runbook — this
+   repository defines none.
+7. **Treat restoration as a coordinated database-recovery operation.** Do not
+   restore an older snapshot over a live or newer database without an approved
+   recovery decision; doing so can discard legitimate writes made after the
+   snapshot.
+8. **Before reopening traffic**, verify the final version in `schema_migrations`,
+   application health, a real login flow, and that audit events are being
+   written.
+
+Distinguish three different actions:
+
+- **Repair and rerun** a failed, rolled-back migration — fix the cause and
+  restart the engine so it re-applies the pending migration. This is the
+  preferred path for a correctable failure.
+- **Restore from backup** after an unrecoverable problem — a full, coordinated
+  database recovery (see above), not a routine step.
+- **Roll back the application binary** — reverting to the previous engine image
+  does **not** roll back schema changes already committed by 0006 or 0007, and
+  an older binary may not understand the newer schema. Decide binary and schema
+  recovery together.
+
 ## Before real customer data
 
 Commission an external penetration test. [PENTEST.md](PENTEST.md) is a scope
