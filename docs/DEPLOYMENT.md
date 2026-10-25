@@ -197,6 +197,29 @@ Distinguish three different actions:
   an older binary may not understand the newer schema. Decide binary and schema
   recovery together.
 
+## Rehearsing migrations and recovery
+
+[`scripts/migration_rehearsal.sh`](../scripts/migration_rehearsal.sh) exercises
+the recovery-relevant properties of this section against disposable, isolated
+Postgres containers, so you can confirm them before and after any schema change:
+
+- **Fresh install** — a brand-new database receives every migration, in order,
+  and the engine becomes reachable afterwards.
+- **Backup and restore** — a `pg_dump` of a populated database restores onto a
+  *separate* target (the "isolated target first" rule above) with identical
+  `schema_migrations` state and the data intact, and a second engine run against
+  the restored target applies zero further migrations.
+- **Upgrade path** — a database left at the pre-0007 state is upgraded by the
+  engine, which applies exactly 0007, and a generic OIDC provider that pre-dates
+  0007 survives as `provider_type='oidc'` with an empty tenant.
+
+It needs only Docker and an engine image (`iam-iam:latest` by default; override
+with `IAM_REHEARSAL_IMAGE`). It uses ephemeral keys, makes no off-host network
+calls, touches nothing already running, and removes everything it creates on
+exit. Exit status is `0` only if every assertion passed. The script is a
+*rehearsal of the mechanism*; the backup tooling, storage, and restore commands
+for a real environment remain the runbook items described above.
+
 ## Before real customer data
 
 Commission an external penetration test. [PENTEST.md](PENTEST.md) is a scope
