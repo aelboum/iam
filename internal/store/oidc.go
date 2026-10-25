@@ -232,15 +232,21 @@ func (s *Store) RevokeAppTokens(ctx context.Context, appID string) error {
 // only those held by users of one org (orgID "" means all users).
 func (s *Store) RevokeProjectTokens(ctx context.Context, projectID, orgID string) error {
 	return s.revokeTokensWhere(ctx, `
-		client_id IN (SELECT client_id FROM apps WHERE project_id = $1)
+		`+projectTokenCond+`
 		AND ($2 = '' OR subject IN (SELECT id::text FROM users WHERE org_id::text = $2))`, projectID, orgID)
 }
 
 // RevokeUserProjectTokens revokes one user's tokens for a project's apps.
 func (s *Store) RevokeUserProjectTokens(ctx context.Context, projectID, userID string) error {
 	return s.revokeTokensWhere(ctx,
-		`client_id IN (SELECT client_id FROM apps WHERE project_id = $1) AND subject = $2`, projectID, userID)
+		projectTokenCond+` AND subject = $2`, projectID, userID)
 }
+
+// projectTokenCond matches tokens for project $1: tokens issued to the
+// project's apps, and machine-user tokens carrying the project scope (those
+// are issued to the machine's own client id, audit L5).
+const projectTokenCond = `(client_id IN (SELECT client_id FROM apps WHERE project_id = $1::uuid)
+	OR ('urn:iam:project:' || $1::text) = ANY(scopes))`
 
 // RotateRefreshToken atomically marks the old refresh token used, deletes its
 // access token and stores the new pair in the same family. It fails with
@@ -295,23 +301,24 @@ func (s *Store) TerminateTokens(ctx context.Context, subject, clientID string) e
 	})
 }
 
-// RevokeUserTokens revokes every token a user holds, across clients.
+// RevokeUserTokens revokes every token, session and password reset token a
+// user holds. Called on lock, password change, logout and deletion.
 func (s *Store) RevokeUserTokens(ctx context.Context, subject string) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `DELETE FROM access_tokens WHERE subject = $1`, subject); err != nil {
-			return mapErr(err)
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM refresh_tokens WHERE subject = $1`, subject); err != nil {
-			return mapErr(err)
-		}
-		_, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id::text = $1`, subject)
-		return mapErr(err)
+		return revokeUserCredentialsTx(ctx, tx, subject)
 	})
 }
 
+// PurgedTables lists every table with an expires_at column that PurgeExpired
+// cleans (audit M7: idp_intents, password_resets and webauthn_registrations
+// were missing; a stale idp_intents row sealed with a removed master key
+// would also block key rotation).
+var PurgedTables = []string{"auth_requests", "access_tokens", "refresh_tokens", "sessions", "signing_keys",
+	"email_verifications", "password_resets", "idp_intents", "webauthn_registrations"}
+
 // PurgeExpired removes expired protocol state.
 func (s *Store) PurgeExpired(ctx context.Context) error {
-	for _, table := range []string{"auth_requests", "access_tokens", "refresh_tokens", "sessions", "signing_keys", "email_verifications"} {
+	for _, table := range PurgedTables {
 		if _, err := s.pool.Exec(ctx, `DELETE FROM `+table+` WHERE expires_at < now()`); err != nil {
 			return mapErr(err)
 		}
@@ -371,51 +378,102 @@ func (s *Store) LockSigningKeys(ctx context.Context, fn func(ctx context.Context
 // --- master key rotation -------------------------------------------------------------------
 
 // encryptedColumns lists every column holding data sealed with the master key.
-var encryptedColumns = []struct{ table, key, column string }{
-	{"signing_keys", "id", "private_key_enc"},
-	{"users", "id", "totp_secret_enc"},
-	{"identity_providers", "id", "client_secret_enc"},
-	{"idp_intents", "id", "code_verifier_enc"},
+// keyType is the primary key's SQL type, so lookups use the index (audit M8).
+var encryptedColumns = []struct{ table, key, keyType, start, column string }{
+	{"signing_keys", "id", "text", "", "private_key_enc"},
+	{"users", "id", "uuid", "00000000-0000-0000-0000-000000000000", "totp_secret_enc"},
+	{"identity_providers", "id", "uuid", "00000000-0000-0000-0000-000000000000", "client_secret_enc"},
+	{"idp_intents", "id", "uuid", "00000000-0000-0000-0000-000000000000", "code_verifier_enc"},
 }
 
-// Reencrypt rewrites every encrypted value for which reseal returns changed,
-// in one transaction. It returns how many values were rewritten.
-func (s *Store) Reencrypt(ctx context.Context, reseal func(sealed []byte) (out []byte, changed bool, err error)) (int, error) {
-	n := 0
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		for _, c := range encryptedColumns { // fixed identifiers, never user input
-			rows, err := tx.Query(ctx, `SELECT `+c.key+`::text, `+c.column+` FROM `+c.table+` WHERE `+c.column+` IS NOT NULL FOR UPDATE`)
+// reencryptBatch bounds how many rows are read per query.
+const reencryptBatch = 500
+
+// EncryptedValue is one sealed value found by ScanEncrypted.
+type EncryptedValue struct {
+	Table, ID string
+	Sealed    []byte
+}
+
+// ScanEncrypted calls fn for every sealed value, table by table in primary
+// key order, reading bounded batches without holding locks. Rows that expire
+// meanwhile are purged first, so stale intents cannot block a rotation.
+func (s *Store) ScanEncrypted(ctx context.Context, fn func(EncryptedValue) error) error {
+	if err := s.PurgeExpired(ctx); err != nil {
+		return err
+	}
+	return s.ScanEncryptedReadOnly(ctx, fn)
+}
+
+// ScanEncryptedReadOnly is ScanEncrypted without the purge: it only issues
+// SELECTs and writes nothing, so `rotate-keys --check` can verify readability
+// without mutating any row (audit M9). Expired rows are included; the caller
+// must still be able to decrypt them under the intended key.
+func (s *Store) ScanEncryptedReadOnly(ctx context.Context, fn func(EncryptedValue) error) error {
+	for _, c := range encryptedColumns { // fixed identifiers, never user input
+		last := c.start
+		for {
+			rows, err := s.pool.Query(ctx, `
+				SELECT `+c.key+`::text, `+c.column+` FROM `+c.table+`
+				WHERE `+c.column+` IS NOT NULL AND `+c.key+` > $1::`+c.keyType+`
+				ORDER BY `+c.key+` LIMIT $2`, last, reencryptBatch)
 			if err != nil {
 				return mapErr(err)
 			}
-			type item struct {
-				id  string
-				val []byte
-			}
-			var items []item
+			var batch []EncryptedValue
 			for rows.Next() {
-				var it item
-				if err := rows.Scan(&it.id, &it.val); err != nil {
+				v := EncryptedValue{Table: c.table}
+				if err := rows.Scan(&v.ID, &v.Sealed); err != nil {
 					rows.Close()
 					return mapErr(err)
 				}
-				items = append(items, it)
+				batch = append(batch, v)
 			}
 			rows.Close()
-			for _, it := range items {
-				out, changed, err := reseal(it.val)
-				if err != nil {
-					return fmt.Errorf("%s %s: %w", c.table, it.id, err)
-				}
-				if !changed {
-					continue
-				}
-				if _, err := tx.Exec(ctx, `UPDATE `+c.table+` SET `+c.column+` = $2 WHERE `+c.key+`::text = $1`, it.id, out); err != nil {
-					return mapErr(err)
-				}
-				n++
+			if err := rows.Err(); err != nil {
+				return mapErr(err)
 			}
+			for _, v := range batch {
+				if err := fn(v); err != nil {
+					return err
+				}
+			}
+			if len(batch) < reencryptBatch {
+				break
+			}
+			last = batch[len(batch)-1].ID
 		}
+	}
+	return nil
+}
+
+// Reencrypt rewrites every sealed value for which reseal reports a change.
+// Each row is updated on its own (compare-and-swap on the old ciphertext),
+// so no long transaction or lock is held. It is idempotent: after a crash or
+// error, run it again and it continues where it stopped. It returns how many
+// values were rewritten.
+func (s *Store) Reencrypt(ctx context.Context, reseal func(sealed []byte) (out []byte, changed bool, err error)) (int, error) {
+	keyTypes := map[string]struct{ key, keyType, column string }{}
+	for _, c := range encryptedColumns {
+		keyTypes[c.table] = struct{ key, keyType, column string }{c.key, c.keyType, c.column}
+	}
+	n := 0
+	err := s.ScanEncrypted(ctx, func(v EncryptedValue) error {
+		out, changed, err := reseal(v.Sealed)
+		if err != nil {
+			return fmt.Errorf("%s %s: %w", v.Table, v.ID, err)
+		}
+		if !changed {
+			return nil
+		}
+		c := keyTypes[v.Table]
+		tag, err := s.pool.Exec(ctx, `UPDATE `+v.Table+` SET `+c.column+` = $2
+			WHERE `+c.key+` = $1::`+c.keyType+` AND `+c.column+` = $3`, v.ID, out, v.Sealed)
+		if err != nil {
+			return mapErr(err)
+		}
+		// 0 rows: the value changed meanwhile, and was written with the current key.
+		n += int(tag.RowsAffected())
 		return nil
 	})
 	return n, err

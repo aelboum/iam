@@ -135,27 +135,16 @@ func (s *Service) FinishPasskeyRegistration(ctx context.Context, user *store.Use
 }
 
 // BeginPasskeyLogin returns the options for navigator.credentials.get().
-// Sessions for unknown users or users without passkeys get options that
-// look the same, so callers cannot tell them apart.
+// The options never list the user's credential IDs (allowCredentials stays
+// empty, as in a discoverable login), so they are identical for known users,
+// users without passkeys and unknown login names, and disclose no credential
+// IDs (audit M5). FinishPasskeyLogin binds the assertion to the session's user.
 func (s *Service) BeginPasskeyLogin(ctx context.Context, c Client, id, token string) (*protocol.CredentialAssertion, error) {
-	sess, user, err := s.loadSession(ctx, c, id, token)
+	sess, _, err := s.loadSession(ctx, c, id, token)
 	if err != nil {
 		return nil, err
 	}
-	var assertion *protocol.CredentialAssertion
-	var session *webauthn.SessionData
-	opts := webauthn.WithUserVerification(protocol.VerificationRequired)
-	var wu *webUser
-	if user != nil {
-		if wu, _, err = s.loadWebUser(ctx, user); err != nil {
-			return nil, err
-		}
-	}
-	if wu != nil && len(wu.creds) > 0 {
-		assertion, session, err = s.webauthn.BeginLogin(wu, opts)
-	} else {
-		assertion, session, err = s.webauthn.BeginDiscoverableLogin(opts)
-	}
+	assertion, session, err := s.webauthn.BeginDiscoverableLogin(webauthn.WithUserVerification(protocol.VerificationRequired))
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +178,7 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, c Client, id, token st
 	if err := json.Unmarshal(sess.WebAuthnSession, &session); err != nil {
 		return nil, err
 	}
-	if !session.Expires.IsZero() && time.Now().After(session.Expires) {
+	if challengeExpired(session, time.Now()) {
 		return nil, ErrInvalidCredentials
 	}
 	parsed, err := protocol.ParseCredentialRequestResponseBytes(response)
@@ -217,13 +206,26 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, c Client, id, token st
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.UpdatePasskeyUse(ctx, credentialID(cred.ID), stored); err != nil {
+	if err := s.store.UpdatePasskeyUse(ctx, credentialID(cred.ID), stored, cred.Authenticator.SignCount); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// A concurrent login already used this or a higher counter value.
+			s.audit(ctx, c, user, "passkey.clone_warning", map[string]any{"credential_id": credentialID(cred.ID)})
+			return nil, ErrInvalidCredentials
+		}
 		return nil, err
 	}
-	if err := s.store.MarkSessionPasskey(ctx, sess.ID); err != nil {
+	if err := s.store.MarkSessionPasskey(ctx, sess.ID, cred.Flags.BackupEligible); err != nil {
 		return nil, err
 	}
 	return s.GetSession(ctx, c, id, token)
+}
+
+// challengeExpired reports whether a stored WebAuthn challenge has passed the
+// server-side deadline recorded when it was issued (audit L7). The engine
+// enforces this itself, so expiry does not depend on the client honouring the
+// ceremony timeout. A zero Expires (older challenges) means no deadline.
+func challengeExpired(session webauthn.SessionData, now time.Time) bool {
+	return !session.Expires.IsZero() && now.After(session.Expires)
 }
 
 // NewWebAuthn configures the relying party. rpID is the domain passkeys are
@@ -233,9 +235,13 @@ func NewWebAuthn(rpID, displayName string, origins []string) (*webauthn.WebAuthn
 	if rpID == "" || len(origins) == 0 {
 		return nil, errors.New("webauthn: RP ID and at least one origin are required")
 	}
+	// Enforce the ceremony timeouts on the server too, so a challenge cannot
+	// be answered long after it was issued (audit L7).
+	timeout := webauthn.TimeoutConfig{Enforce: true, Timeout: 5 * time.Minute, TimeoutUVD: 5 * time.Minute}
 	return webauthn.New(&webauthn.Config{
 		RPID:          rpID,
 		RPDisplayName: displayName,
 		RPOrigins:     origins,
+		Timeouts:      webauthn.TimeoutsConfig{Login: timeout, Registration: timeout},
 	})
 }

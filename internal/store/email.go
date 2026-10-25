@@ -72,21 +72,67 @@ func (s *Store) ConsumeEmailVerification(ctx context.Context, userID string, che
 
 // --- password reset ---------------------------------------------------------------------
 
-// CreatePasswordReset stores a reset token for a user, replacing an older one
-// unless that was issued within the cooldown (then ErrTooSoon).
-func (s *Store) CreatePasswordReset(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
-	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES ($1, $2, $3)
-		ON CONFLICT (user_id) DO UPDATE SET token_hash = $2, expires_at = $3, created_at = now()
-		WHERE password_resets.created_at < now() - make_interval(secs => $4)`,
-		userID, tokenHash, expiresAt, emailCodeCooldown.Seconds())
-	if err != nil {
-		return mapErr(err)
+// maxOutstandingResets bounds how many unexpired reset tokens a user can hold.
+// A new request does not invalidate the token already emailed (audit L2).
+const maxOutstandingResets = 3
+
+// CreatePasswordReset stores a new reset token. It returns ErrTooSoon if the
+// user received one within the cooldown; callers must then answer exactly as
+// for an unknown user, so the cooldown reveals nothing (audit L1).
+// rowQuerier is the QueryRow method shared by the pool and a transaction, so a
+// read can run either locked (inside a tx) or lock-free (on the pool).
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// recentReset reports whether userID has a reset token created within the
+// cooldown window. Indexed by password_resets_user_idx.
+func (s *Store) recentReset(ctx context.Context, q rowQuerier, userID string) (bool, error) {
+	var recent int
+	if err := q.QueryRow(ctx, `
+		SELECT count(*) FROM password_resets
+		WHERE user_id = $1 AND created_at > now() - make_interval(secs => $2)`,
+		userID, emailCodeCooldown.Seconds()).Scan(&recent); err != nil {
+		return false, mapErr(err)
 	}
-	if tag.RowsAffected() == 0 {
+	return recent > 0, nil
+}
+
+func (s *Store) CreatePasswordReset(ctx context.Context, userID, tokenHash string, expiresAt time.Time) error {
+	// Fast path: reject a request made during the cooldown with a single
+	// indexed read, no lock and no transaction. This keeps the cost of a
+	// rejected request close to that of an unknown-user lookup, so a holder of
+	// a login key learns little about account state from response timing
+	// (audit L1). It is only a fast path: the lock-held re-check below still
+	// enforces the cooldown and the outstanding-token cap exactly, so a burst
+	// of concurrent requests still yields at most one new token.
+	if tooSoon, err := s.recentReset(ctx, s.pool, userID); err != nil {
+		return err
+	} else if tooSoon {
 		return ErrTooSoon
 	}
-	return nil
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Serialize requests for the same user.
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID); err != nil {
+			return mapErr(err)
+		}
+		if tooSoon, err := s.recentReset(ctx, tx, userID); err != nil {
+			return err
+		} else if tooSoon {
+			return ErrTooSoon
+		}
+		// Keep at most maxOutstandingResets-1 older unexpired tokens.
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM password_resets WHERE user_id = $1 AND token_hash NOT IN (
+				SELECT token_hash FROM password_resets WHERE user_id = $1 AND expires_at > now()
+				ORDER BY created_at DESC LIMIT $2)`, userID, maxOutstandingResets-1); err != nil {
+			return mapErr(err)
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES ($1, $2, $3)`,
+			tokenHash, userID, expiresAt)
+		return mapErr(err)
+	})
 }
 
 // PeekPasswordReset returns the user of an unexpired reset token without using it.
@@ -97,16 +143,53 @@ func (s *Store) PeekPasswordReset(ctx context.Context, tokenHash string) (string
 	return userID, mapErr(err)
 }
 
-// ConsumePasswordReset removes an unexpired reset token and returns its user.
-// A token works exactly once.
-func (s *Store) ConsumePasswordReset(ctx context.Context, tokenHash string) (string, error) {
-	var userID string
-	err := s.pool.QueryRow(ctx,
-		`DELETE FROM password_resets WHERE token_hash = $1 AND expires_at > now() RETURNING user_id`, tokenHash).Scan(&userID)
-	return userID, mapErr(err)
+// CompletePasswordReset atomically consumes the token, sets the new password
+// hash and ends every session, token and outstanding reset of the user. It
+// fails with ErrNotFound and changes nothing if the token is unknown, used or
+// expired, or if the user is locked or not a human user (audit M12).
+// Only the password failure counter is cleared: TOTP failures and an active
+// lockout stay in force (audit L3).
+func (s *Store) CompletePasswordReset(ctx context.Context, tokenHash, userID, passwordHash string) error {
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx,
+			`DELETE FROM password_resets WHERE token_hash = $1 AND user_id = $2 AND expires_at > now()`,
+			tokenHash, userID)
+		if err != nil {
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		tag, err = tx.Exec(ctx, `
+			UPDATE users SET password_hash = $2, failed_logins = 0, updated_at = now()
+			WHERE id = $1 AND NOT locked AND kind = $3`, userID, passwordHash, KindHuman)
+		if err != nil {
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return revokeUserCredentialsTx(ctx, tx, userID)
+	})
 }
 
-// ClearTemporaryLockout ends a failed-login lockout (not a manual lock).
-func (s *Store) ClearTemporaryLockout(ctx context.Context, userID string) error {
-	return s.execOne(ctx, `UPDATE users SET locked_until = NULL, failed_logins = 0, mfa_failed_logins = 0 WHERE id = $1`, userID)
+// DeletePasswordResets invalidates every outstanding reset token of a user.
+func (s *Store) DeletePasswordResets(ctx context.Context, userID string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM password_resets WHERE user_id = $1`, userID)
+	return mapErr(err)
+}
+
+// revokeUserCredentialsTx ends a user's tokens, sessions and reset tokens.
+func revokeUserCredentialsTx(ctx context.Context, tx pgx.Tx, userID string) error {
+	for _, stmt := range []string{
+		`DELETE FROM access_tokens WHERE subject = $1`,
+		`DELETE FROM refresh_tokens WHERE subject = $1`,
+		`DELETE FROM sessions WHERE user_id::text = $1`,
+		`DELETE FROM password_resets WHERE user_id::text = $1`,
+	} {
+		if _, err := tx.Exec(ctx, stmt, userID); err != nil {
+			return mapErr(err)
+		}
+	}
+	return nil
 }

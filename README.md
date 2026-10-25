@@ -134,18 +134,36 @@ Other ways to authenticate the session in step 3:
 
 - **Passkey (passwordless):** `POST /v1/sessions/{sid}/passkey/begin` gives options for
   `navigator.credentials.get()`. Send the result to `.../passkey/finish`. A user-verified
-  passkey authenticates on its own (`amr: hwk, mfa`). Users register passkeys with
+  passkey authenticates on its own (`amr: hwk, user, mfa`; `swk` instead of `hwk` for
+  synced passkeys). The options never list credential IDs. Users register passkeys with
   `POST /v1/users/{id}/passkeys/registration` (+ `/finish`). Set `IAM_WEBAUTHN_RP_ID`
   and `IAM_WEBAUTHN_ORIGINS` to your login UI's domain and origin.
 - **SSO with the org's own IdP:**
   - An org admin adds an OpenID Connect provider (`POST /v1/orgs/{id}/idps`) and
     registers the returned `callback_url` at that IdP.
-  - `POST /v1/federated-logins` gives an `auth_url`. After the IdP login, the browser
-    returns to your `return_url?intent=&code=`.
-  - `POST /v1/federated-logins/{intent}/redeem` gives an authenticated session (`amr: fed`).
-  - Users are created on first login (JIT) and linked by IdP subject.
+  - Login UI contract (prevents login CSRF): before starting, your login UI sets a
+    cookie on its own origin with at least 32 random bytes (base64url), `HttpOnly`,
+    `Secure`, `SameSite=Lax`, lifetime about 10 minutes. It sends that value as
+    `browser_binding` to `POST /v1/federated-logins`, which gives an `auth_url`. After
+    the IdP login the browser returns to your `return_url?intent=&code=`; your backend
+    reads the cookie of *that* browser, sends it again as `browser_binding` to
+    `POST /v1/federated-logins/{intent}/redeem`, and deletes the cookie. A redeem from
+    a browser without the cookie fails and uses up the intent.
+  - The redeemed session has `amr: fed`. If the user enrolled TOTP, it is required as
+    well (`POST /v1/sessions/{id}/totp`) unless an instance admin marked the IdP
+    `trust_mfa` (`amr: fed, mfa`).
+  - Users are linked by IdP subject. Creating users on first login (JIT) is off by
+    default: set `auto_create_users`. `allowed_email_domains` limits which IdP users
+    may be provisioned or linked (an exact domain list, a filter, not proof of identity).
+  - The IdP's `email_verified` claim and linking existing users by email
+    (`link_by_email`) are only honoured if an instance admin sets `trust_email`
+    (`PUT /v1/orgs/{id}/idps/{idp}/trust`): the IdP is configured by the tenant, who
+    could otherwise claim any email address.
 - **Forgot password:** `POST /v1/password-resets` returns a token for your backend to
   email. `POST /v1/password-resets/confirm` sets the new password and ends all sessions.
+  The answer for unknown, locked and machine users and during the one-minute cooldown
+  is the same `202 {}`. Any login-scoped key can reset passwords of the users it
+  serves, so give login keys only to backends you trust with account recovery.
 
 **Machine users** (service accounts) call APIs without a person:
 
@@ -179,7 +197,8 @@ All of these are exercised by `scripts/smoke_test.py`.
   attacker can slow a user down but never lock them out for good. While locked, the
   password is not evaluated at all and every attempt answers `401`, so guessing during a
   lockout learns nothing. Password and TOTP failures are counted separately; a correct
-  password does not reset TOTP failures.
+  password does not reset TOTP failures, and a password reset does not lift a lockout
+  (an admin can, with `POST /v1/users/{id}/unlock`).
 - Unknown login names get a real-looking session and fail at the password step exactly
   like a wrong password, with the same hashing time. Session state reveals nothing about
   the user until the password is verified.
@@ -248,20 +267,25 @@ All of these are exercised by `scripts/smoke_test.py`.
 - Machine users cannot log in interactively, have no password or TOTP, and can only get
   roles for projects their org was granted. Rotating the secret ends their tokens.
 - Password reset tokens are single use, expire after 30 minutes and are rate-limited to
-  one per minute.
+  one per minute; at most three are outstanding per user. A password change, email
+  change, lock, TOTP or passkey change invalidates them, and locked or machine users
+  cannot reset.
 
 **Key management**
-- Master key rotation:
+- Master key rotation (details and recovery in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)):
   1. Set the new key in `IAM_MASTER_KEY` and the old one in `IAM_MASTER_KEY_PREVIOUS`,
-     then restart.
-  2. Run `iamd rotate-keys` (`docker compose run --rm iam rotate-keys`).
-  3. Remove the old key.
-  - Opaque access tokens and pending email codes issued under the old key stop working,
-    which is harmless because they are short-lived.
+     then restart. Everything issued before keeps working.
+  2. Run `iamd rotate-keys` (`docker compose run --rm iam rotate-keys`). It works in
+     small batches and can be interrupted and re-run.
+  3. Run `iamd rotate-keys --check`; it fails if anything still needs the old key.
+  4. After 30 minutes (or `IAM_ACCESS_TOKEN_TTL`, if longer), remove the old key.
 
 **Known limits**
 - Rate limits are in memory per instance by default. Set `IAM_SHARED_RATE_LIMITS=true`
-  to count them in Postgres across all instances (one-minute windows).
+  to count them in Postgres across all instances (sliding one-minute window). Each
+  instance still applies the same limit locally first, uses a separate pool of 4
+  database connections for the counts, and falls back to its local limit if the
+  database is slow or down. Counts reset after a database crash or failover.
 - `X-End-User-IP` is trusted from API-key holders on the login API. Only give keys to your own backends.
 - Per-tenant quotas: 100k users, 100 projects and 50 API keys per org; 50 apps and 200
   roles per project. Lists are paginated (`?limit=`, max 1000, and `?offset=`).

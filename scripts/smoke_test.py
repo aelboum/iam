@@ -50,7 +50,7 @@ def http(method, path, body=None, headers=None, form=None):
     url = path if path.startswith("http") else ISSUER + path
     data = None
     headers = dict(headers or {})
-    if path.startswith(("/v1/sessions", "/v1/auth-requests")):
+    if path.startswith(("/v1/sessions", "/v1/auth-requests", "/v1/password-resets", "/v1/federated-logins")):
         # Like a real login UI backend: forward the end user's IP. Each call
         # pretends to be a different browser so the per-IP limit is not hit.
         headers.setdefault("X-End-User-IP", f"198.51.100.{secrets.randbelow(254) + 1}")

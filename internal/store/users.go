@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type User struct {
@@ -234,9 +235,16 @@ func (s *Store) SetLocked(ctx context.Context, id string, locked bool) error {
 }
 
 // DeleteUserSessions ends every login in progress for a user.
+// It also invalidates outstanding password reset tokens, because it is called
+// on every credential change (TOTP, passkeys, email), see audit M12.
 func (s *Store) DeleteUserSessions(ctx context.Context, userID string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
-	return mapErr(err)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID); err != nil {
+			return mapErr(err)
+		}
+		_, err := tx.Exec(ctx, `DELETE FROM password_resets WHERE user_id = $1`, userID)
+		return mapErr(err)
+	})
 }
 
 // SetPendingTOTP stores a new, not yet verified TOTP secret.

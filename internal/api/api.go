@@ -101,6 +101,7 @@ func (s *Server) Routes() http.Handler {
 				r.Post("/idps", s.createIDP)
 				r.Get("/idps", s.listIDPs)
 				r.Delete("/idps/{idpID}", s.deleteIDP)
+				r.With(requireInstanceAdmin).Put("/idps/{idpID}/trust", s.setIDPTrust)
 				r.Get("/users", s.listUsers)
 				r.Post("/projects", s.createProject)
 				r.Get("/projects", s.listProjects)
@@ -349,6 +350,8 @@ func fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, authn.ErrLocked):
 		writeError(w, http.StatusLocked, err.Error())
+	case errors.Is(err, authn.ErrUnsafeIdP):
+		writeError(w, http.StatusBadGateway, "identity provider advertises an unsafe endpoint")
 	case errors.Is(err, errQuota):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, authn.ErrRateLimited):

@@ -178,6 +178,14 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, validationError("org keys cannot mark emails verified directly; use /email/verification"))
 		return
 	}
+	// A reset token emailed to the old address must not survive (audit M12).
+	// Delete first: if the update then fails, no token was left valid.
+	if patch.Email != nil {
+		if err := s.store.DeletePasswordResets(r.Context(), user.ID); err != nil {
+			fail(w, r, err)
+			return
+		}
+	}
 	updated, err := s.store.UpdateUser(r.Context(), user.ID, patch)
 	if err != nil {
 		fail(w, r, err)

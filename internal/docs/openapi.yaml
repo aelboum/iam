@@ -521,7 +521,7 @@ paths:
                 redirect_uris: { type: array, items: { type: string }, example: ["http://localhost:3000/callback"] }
                 post_logout_redirect_uris: { type: array, items: { type: string } }
                 access_token_type: { type: string, enum: [jwt, bearer], default: jwt }
-                login_url: { type: string, description: Your login UI. Receives `?authRequest=<id>`., example: "http://localhost:3000/login" }
+                login_url: { type: string, description: "Your login UI. Receives `?authRequest=<id>`.", example: "http://localhost:3000/login" }
                 dev_mode: { type: boolean, description: Allow http redirect URIs. Dev only. }
       responses:
         "201":
@@ -647,10 +647,17 @@ paths:
                 client_id: { type: string }
                 client_secret: { type: string }
                 scopes: { type: array, items: { type: string }, default: [openid, profile, email] }
-                auto_create_users: { type: boolean, default: true, description: Create a user on first login (JIT) }
-                link_by_email: { type: boolean, default: false, description: Link to an existing user with the same verified email }
+                auto_create_users: { type: boolean, default: false, description: Create a user on first login (JIT) }
+                link_by_email: { type: boolean, default: false, description: "Link to an existing user with the same verified email. Requires trust_email." }
+                trust_email: { type: boolean, default: false, description: "Instance admin only: trust the IdP's email_verified claim" }
+                trust_mfa: { type: boolean, default: false, description: "Instance admin only: an IdP login satisfies MFA (otherwise enrolled TOTP is still required)" }
+                allowed_email_domains:
+                  type: array
+                  items: { type: string, example: acme.com }
+                  description: Exact email domains whose IdP users may be provisioned or linked (a filter, not proof of identity). No wildcards.
       responses:
         "201": { description: Created; includes callback_url }
+        "400": { $ref: "#/components/responses/Error" }
     get:
       tags: [SSO]
       summary: List the org's identity providers
@@ -667,6 +674,26 @@ paths:
       responses:
         "204": { description: Deleted }
 
+  /v1/orgs/{orgID}/idps/{idpID}/trust:
+    parameters:
+      - { $ref: "#/components/parameters/orgID" }
+      - { name: idpID, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [SSO]
+      summary: Set an IdP's trust policy (instance admin keys only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                trust_email: { type: boolean }
+                trust_mfa: { type: boolean }
+      responses:
+        "200": { description: Updated identity provider }
+        "403": { $ref: "#/components/responses/Error" }
+
   /v1/federated-logins:
     post:
       tags: [SSO]
@@ -674,6 +701,11 @@ paths:
       description: |
         After the IdP login the browser returns to `return_url?intent=...&code=...`
         (or `&error=...`). Exchange intent and code at `/v1/federated-logins/{intentID}/redeem`.
+
+        `browser_binding` ties the login to the browser that started it (login CSRF
+        protection): at least 32 random bytes (base64url) that the login UI stores in an
+        `HttpOnly`, `Secure`, `SameSite=Lax` cookie on its own origin. The redeem call must
+        send the value from the returning browser's cookie.
       parameters: [{ $ref: "#/components/parameters/endUserIP" }]
       requestBody:
         required: true
@@ -681,11 +713,12 @@ paths:
           application/json:
             schema:
               type: object
-              required: [org, idp_id, return_url]
+              required: [org, idp_id, return_url, browser_binding]
               properties:
                 org: { type: string }
                 idp_id: { type: string, format: uuid }
                 return_url: { type: string, example: "https://app.example.com/sso-return" }
+                browser_binding: { type: string, minLength: 43, maxLength: 512 }
       responses:
         "201":
           description: Intent created
@@ -702,16 +735,18 @@ paths:
       - { name: intentID, in: path, required: true, schema: { type: string, format: uuid } }
     post:
       tags: [SSO]
-      summary: Exchange a completed SSO login for an authenticated session (single use)
+      summary: Exchange a completed SSO login for a session (single use, same browser only)
+      description: A wrong or missing browser_binding fails with 401 and uses up the intent.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [code]
+              required: [code, browser_binding]
               properties:
                 code: { type: string }
+                browser_binding: { type: string, description: Value from the returning browser's cookie }
       responses:
         "201": { $ref: "#/components/responses/Session" }
         "401": { $ref: "#/components/responses/Error" }
@@ -720,7 +755,11 @@ paths:
     post:
       tags: [Password reset]
       summary: Issue a password reset token (your backend emails it)
-      description: Returns 202 with no token for unknown users, so show the same message either way. One request per minute per user.
+      description: |
+        Returns 202 with an empty body for unknown, locked and machine users and while the
+        one-minute cooldown is active, so show the same message either way. Earlier tokens
+        stay valid (at most three per user).
+        Any login-scoped key can reset passwords of the users it serves.
       parameters: [{ $ref: "#/components/parameters/endUserIP" }]
       requestBody:
         required: true

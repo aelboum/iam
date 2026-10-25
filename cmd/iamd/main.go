@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -36,8 +37,16 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if len(os.Args) > 1 && os.Args[1] == "rotate-keys" {
-		if err := rotateKeys(); err != nil {
+		check := len(os.Args) > 2 && os.Args[2] == "--check"
+		if err := rotateKeys(check); err != nil {
 			slog.Error("rotate-keys failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "purge" {
+		if err := purgeOnce(); err != nil {
+			slog.Error("purge failed", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -85,6 +94,13 @@ func run() error {
 	// Shared limits count across all instances; in-memory limits per instance.
 	limits := ratelimit.Factory(ratelimit.Memory)
 	if cfg.SharedRateLimits {
+		// A small dedicated pool, so a saturated main pool cannot stall limits (audit M10).
+		limiterPool, err := db.OpenLimited(ctx, cfg.DatabaseURL, 4)
+		if err != nil {
+			return err
+		}
+		defer limiterPool.Close()
+		st.SetLimiterPool(limiterPool)
 		limits = func(name string, perMinute float64, burst int) ratelimit.Allower {
 			return st.NewPGLimiter(name, perMinute, burst)
 		}
@@ -93,16 +109,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	slog.Info("passkeys", "rp_id", cfg.WebAuthnRPID, "origins", cfg.WebAuthnOrigins)
+	var previousCodeKeys [][32]byte
+	for _, k := range cfg.PreviousMasterKeys {
+		previousCodeKeys = append(previousCodeKeys, secret.Derive(k, "email-code-hmac"))
+	}
 	an := authn.NewService(st, box, authn.Config{
-		Limits:          limits,
-		Issuer:          cfg.Issuer,
-		DevMode:         cfg.DevMode,
-		WebAuthn:        webAuthn,
-		IssuerName:      issuerURL.Host,
-		SessionLifetime: cfg.LoginLifetime,
-		MaxFailedLogins: cfg.MaxFailedLogins,
-		LockoutDuration: cfg.LockoutDuration,
-		CodeKey:         secret.Derive(cfg.MasterKey, "email-code-hmac"),
+		Limits:           limits,
+		Issuer:           cfg.Issuer,
+		DevMode:          cfg.DevMode,
+		WebAuthn:         webAuthn,
+		IssuerName:       issuerURL.Host,
+		SessionLifetime:  cfg.LoginLifetime,
+		MaxFailedLogins:  cfg.MaxFailedLogins,
+		LockoutDuration:  cfg.LockoutDuration,
+		CodeKey:          secret.Derive(cfg.MasterKey, "email-code-hmac"),
+		PreviousCodeKeys: previousCodeKeys,
 	})
 	storage := oidcop.NewStorage(st, an, box, oidcop.TokenConfig{
 		KeyRotation:   cfg.KeyRotationInterval,
@@ -110,7 +132,7 @@ func run() error {
 		RefreshIdle:   cfg.RefreshIdle,
 		SessionMaxAge: cfg.SessionMaxAge,
 	})
-	provider, err := oidcop.NewProvider(cfg.Issuer, cfg.MasterKey, cfg.DevMode, storage)
+	provider, err := oidcop.NewProvider(cfg.Issuer, cfg.MasterKey, cfg.PreviousMasterKeys, cfg.DevMode, storage)
 	if err != nil {
 		return err
 	}
@@ -224,10 +246,21 @@ func atRestBox(cfg *config.Config) *secret.Box {
 	return secret.NewBox(secret.Derive(cfg.MasterKey, "at-rest-encryption"), previous...)
 }
 
+// keyFingerprint identifies a master key in logs without revealing it.
+func keyFingerprint(k [32]byte) string {
+	return secret.Hash(string(k[:]))[:12]
+}
+
 // rotateKeys re-encrypts all stored secrets with the current master key.
 // Run it after deploying a new IAM_MASTER_KEY with the old one in
-// IAM_MASTER_KEY_PREVIOUS; afterwards the old key can be removed.
-func rotateKeys() error {
+// IAM_MASTER_KEY_PREVIOUS. It works in small batches and can be re-run
+// after an interruption.
+//
+// With --check it is strictly read-only (no insert, update or delete): it
+// opens every encrypted value with the current key only and fails if any
+// value still needs a previous key (audit M9). Only remove
+// IAM_MASTER_KEY_PREVIOUS after --check succeeds.
+func rotateKeys(check bool) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -241,8 +274,31 @@ func rotateKeys() error {
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
 	}
+	st := store.New(pool)
+	slog.Info("master key", "fingerprint", keyFingerprint(cfg.MasterKey), "previous_keys", len(cfg.PreviousMasterKeys))
+	if check {
+		currentOnly := secret.NewBox(secret.Derive(cfg.MasterKey, "at-rest-encryption"))
+		var total, unreadable int
+		// Read-only: --check must never insert, update or delete a row.
+		err := st.ScanEncryptedReadOnly(ctx, func(v store.EncryptedValue) error {
+			total++
+			if _, err := currentOnly.Open(v.Sealed); err != nil {
+				unreadable++
+				slog.Error("value not readable with the current master key", "table", v.Table, "id", v.ID)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if unreadable > 0 {
+			return fmt.Errorf("%d of %d encrypted values need a previous key: run `iamd rotate-keys` and keep IAM_MASTER_KEY_PREVIOUS", unreadable, total)
+		}
+		slog.Info("all encrypted values are readable with the current master key; IAM_MASTER_KEY_PREVIOUS can be removed after the token lifetimes noted in DEPLOYMENT.md", "values", total)
+		return nil
+	}
 	box := atRestBox(cfg)
-	n, err := store.New(pool).Reencrypt(ctx, func(sealed []byte) ([]byte, bool, error) {
+	n, err := st.Reencrypt(ctx, func(sealed []byte) ([]byte, bool, error) {
 		plain, current, err := box.OpenCurrent(sealed)
 		if err != nil || current {
 			return nil, false, err
@@ -252,8 +308,31 @@ func rotateKeys() error {
 	if err != nil {
 		return err
 	}
-	slog.Info("re-encrypted secrets with the current master key", "values", n)
+	slog.Info("re-encrypted secrets with the current master key; now run `iamd rotate-keys --check`", "values", n)
 	return nil
+}
+
+// purgeOnce deletes expired rows once (the server does this every 10 minutes).
+func purgeOnce() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := db.Migrate(ctx, pool); err != nil {
+		return err
+	}
+	st := store.New(pool)
+	if err := st.PurgeExpired(ctx); err != nil {
+		return err
+	}
+	slog.Info("purged expired rows", "tables", store.PurgedTables)
+	return st.PurgeRateLimits(ctx)
 }
 
 // securityHeaders sets defensive headers on every response.

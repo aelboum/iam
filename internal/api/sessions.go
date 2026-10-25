@@ -200,6 +200,8 @@ func (s *Server) startFederatedLogin(w http.ResponseWriter, r *http.Request) {
 		Org       string `json:"org"`
 		IDPID     string `json:"idp_id"`
 		ReturnURL string `json:"return_url"`
+		// BrowserBinding: random secret from the login UI's HttpOnly cookie (see authn).
+		BrowserBinding string `json:"browser_binding"`
 	}
 	if !decode(w, r, &body) {
 		return
@@ -214,7 +216,7 @@ func (s *Server) startFederatedLogin(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, validationError("return_url must be an https URL of your login UI"))
 		return
 	}
-	start, err := s.authn.StartFederatedLogin(r.Context(), org.ID, body.IDPID, body.ReturnURL)
+	start, err := s.authn.StartFederatedLogin(r.Context(), org.ID, body.IDPID, body.ReturnURL, body.BrowserBinding)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -224,12 +226,13 @@ func (s *Server) startFederatedLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) redeemFederatedLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Code string `json:"code"`
+		Code           string `json:"code"`
+		BrowserBinding string `json:"browser_binding"`
 	}
 	if !decode(w, r, &body) {
 		return
 	}
-	state, err := s.authn.RedeemFederatedLogin(r.Context(), loginClient(r), chi.URLParam(r, "intentID"), body.Code)
+	state, err := s.authn.RedeemFederatedLogin(r.Context(), loginClient(r), chi.URLParam(r, "intentID"), body.Code, body.BrowserBinding)
 	if err != nil {
 		fail(w, r, err)
 		return

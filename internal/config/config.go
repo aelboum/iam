@@ -138,7 +138,38 @@ func Load() (*Config, error) {
 	if !cfg.DevMode && strings.HasPrefix(cfg.Issuer, "http://") {
 		return nil, errors.New("IAM_ISSUER must use https unless IAM_DEV_MODE=true")
 	}
+	if err := ValidateWebAuthn(cfg.WebAuthnRPID, cfg.WebAuthnOrigins, cfg.DevMode); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+// ValidateWebAuthn checks the passkey relying party settings (audit L10):
+// every origin must be an origin (scheme://host[:port], nothing else) whose
+// host is the RP ID or a subdomain of it, and outside dev mode it must use https.
+func ValidateWebAuthn(rpID string, origins []string, devMode bool) error {
+	rpID = strings.ToLower(rpID)
+	if rpID == "" || strings.ContainsAny(rpID, ":/") {
+		return errors.New("IAM_WEBAUTHN_RP_ID must be a bare domain name")
+	}
+	if len(origins) == 0 {
+		return errors.New("IAM_WEBAUTHN_ORIGINS needs at least one origin")
+	}
+	for _, o := range origins {
+		u, err := url.Parse(o)
+		// Exactly an origin: browsers send it without a trailing slash and it is compared exactly.
+		if err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+			return fmt.Errorf("IAM_WEBAUTHN_ORIGINS entry %q must be an origin like https://login.example.com", o)
+		}
+		if u.Scheme != "https" && !(devMode && u.Scheme == "http") {
+			return fmt.Errorf("IAM_WEBAUTHN_ORIGINS entry %q must use https unless IAM_DEV_MODE=true", o)
+		}
+		host := strings.ToLower(u.Hostname())
+		if host != rpID && !strings.HasSuffix(host, "."+rpID) {
+			return fmt.Errorf("IAM_WEBAUTHN_ORIGINS entry %q is not within IAM_WEBAUTHN_RP_ID %q", o, rpID)
+		}
+	}
+	return nil
 }
 
 func env(name, fallback string) string {

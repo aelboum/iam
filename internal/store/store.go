@@ -22,6 +22,8 @@ var (
 
 type Store struct {
 	pool *pgxpool.Pool
+	// limiterPool is a small dedicated pool for shared rate limits (optional).
+	limiterPool *pgxpool.Pool
 }
 
 func New(pool *pgxpool.Pool) *Store {

@@ -232,8 +232,12 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		ClientID        string   `json:"client_id"`
 		ClientSecret    string   `json:"client_secret"`
 		Scopes          []string `json:"scopes"`
-		AutoCreateUsers *bool    `json:"auto_create_users"`
+		AutoCreateUsers bool     `json:"auto_create_users"` // default false (audit M11)
 		LinkByEmail     bool     `json:"link_by_email"`
+		// Instance admin only (audit M2, D1).
+		TrustEmail          bool     `json:"trust_email"`
+		TrustMFA            bool     `json:"trust_mfa"`
+		AllowedEmailDomains []string `json:"allowed_email_domains"`
 	}
 	if !decode(w, r, &body) {
 		return
@@ -244,8 +248,22 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Plain http and private hosts are also refused at connect time outside dev mode.
-	if !redirectURLAllowed(body.Issuer, false, s.devMode) {
+	issuer := strings.TrimRight(body.Issuer, "/")
+	if !redirectURLAllowed(issuer, false, s.devMode) {
 		fail(w, r, validationError("issuer must be an https URL"))
+		return
+	}
+	if (body.TrustEmail || body.TrustMFA) && !principalFrom(r.Context()).isAdmin() {
+		fail(w, r, validationError("only an instance admin can set trust_email or trust_mfa"))
+		return
+	}
+	if body.LinkByEmail && !body.TrustEmail {
+		fail(w, r, validationError("link_by_email requires trust_email (set by an instance admin)"))
+		return
+	}
+	domains, err := normalizeDomains(body.AllowedEmailDomains)
+	if err != nil {
+		fail(w, r, err)
 		return
 	}
 	if body.ClientID == "" || body.ClientSecret == "" || len(body.ClientID) > 256 || len(body.ClientSecret) > 1024 {
@@ -263,11 +281,12 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
-	autoCreate := body.AutoCreateUsers == nil || *body.AutoCreateUsers
 	idp, err := s.store.CreateIDP(r.Context(), store.IDP{
-		OrgID: orgID, Name: body.Name, Issuer: strings.TrimRight(body.Issuer, "/"), ClientID: body.ClientID,
+		OrgID: orgID, Name: body.Name,
+		Issuer: issuer, ClientID: body.ClientID,
 		ClientSecretEnc: s.box.Seal([]byte(body.ClientSecret)), Scopes: body.Scopes,
-		AutoCreateUsers: autoCreate, LinkByEmail: body.LinkByEmail,
+		AutoCreateUsers: body.AutoCreateUsers, LinkByEmail: body.LinkByEmail,
+		TrustEmail: body.TrustEmail, TrustMFA: body.TrustMFA, AllowedEmailDomains: domains,
 	})
 	if err != nil {
 		fail(w, r, err)
@@ -278,6 +297,41 @@ func (s *Server) createIDP(w http.ResponseWriter, r *http.Request) {
 		*store.IDP
 		CallbackURL string `json:"callback_url"`
 	}{idp, s.issuer + authn.CallbackPath})
+}
+
+// normalizeDomains lowercases and validates an email domain allowlist.
+func normalizeDomains(in []string) ([]string, error) {
+	if err := validList("allowed_email_domains", in); err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, d := range in {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if !authn.ValidDomain(d) || !strings.Contains(d, ".") {
+			return nil, validationError("invalid email domain: " + d + " (exact domains only, no wildcards)")
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// setIDPTrust lets an instance admin change an IdP's trust policy.
+func (s *Server) setIDPTrust(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TrustEmail bool `json:"trust_email"`
+		TrustMFA   bool `json:"trust_mfa"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	orgID, id := chi.URLParam(r, "orgID"), chi.URLParam(r, "idpID")
+	idp, err := s.store.SetIDPTrust(r.Context(), orgID, id, body.TrustEmail, body.TrustMFA)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, orgID, "idp.trust_changed", "idp:"+id, map[string]any{"trust_email": body.TrustEmail, "trust_mfa": body.TrustMFA})
+	writeJSON(w, http.StatusOK, idp)
 }
 
 func (s *Server) listIDPs(w http.ResponseWriter, r *http.Request) {

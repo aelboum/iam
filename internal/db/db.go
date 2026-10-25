@@ -27,6 +27,26 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
+// OpenLimited opens a small pool of at most maxConns connections, for work
+// that must not compete with the main pool (shared rate limits).
+func OpenLimited(ctx context.Context, url string, maxConns int32) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	config.MaxConns = maxConns
+	config.MinConns = 1
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("open pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+	return pool, nil
+}
+
 // Migrate applies every migration file not yet recorded in schema_migrations,
 // in lexical order, each inside its own transaction.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {

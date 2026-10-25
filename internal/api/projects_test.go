@@ -30,3 +30,19 @@ func TestRedirectURLAllowed(t *testing.T) {
 		}
 	}
 }
+
+// Audit M11: email domain allowlists are exact, validated domains.
+func TestNormalizeDomains(t *testing.T) {
+	got, err := normalizeDomains([]string{" Example.COM ", "sub.example.org"})
+	if err != nil || len(got) != 2 || got[0] != "example.com" || got[1] != "sub.example.org" {
+		t.Fatalf("normalizeDomains = %v, %v", got, err)
+	}
+	if got, err := normalizeDomains(nil); err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("normalizeDomains(nil) = %v, %v; want empty list", got, err)
+	}
+	for _, bad := range []string{"*.example.com", "localhost", "example..com", "exa mple.com", "@example.com", ""} {
+		if _, err := normalizeDomains([]string{bad}); err == nil {
+			t.Errorf("normalizeDomains(%q) accepted", bad)
+		}
+	}
+}

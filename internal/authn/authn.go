@@ -58,9 +58,12 @@ type Config struct {
 	WebAuthn *webauthn.WebAuthn
 	// CodeKey keys the HMAC of stored email codes, so a database leak alone
 	// does not reveal them (6-digit codes are trivially brute-forced from a plain hash).
-	CodeKey         [32]byte
-	SessionLifetime time.Duration
-	MaxFailedLogins int
+	CodeKey [32]byte
+	// PreviousCodeKeys are derived from IAM_MASTER_KEY_PREVIOUS, so codes issued
+	// before a master key rotation keep working until they expire (audit M6).
+	PreviousCodeKeys [][32]byte
+	SessionLifetime  time.Duration
+	MaxFailedLogins  int
 	// Limits builds the rate limiters (in-memory or shared).
 	Limits          ratelimit.Factory
 	LockoutDuration time.Duration
@@ -227,7 +230,15 @@ func (s *Service) StartEmailVerification(ctx context.Context, user *store.User) 
 
 func (s *Service) ConfirmEmail(ctx context.Context, user *store.User, code string) error {
 	ok, err := s.store.ConsumeEmailVerification(ctx, user.ID, func(hash string) bool {
-		return secret.Equal(hash, s.codeHash(user.ID, code))
+		if secret.Equal(hash, s.codeHash(user.ID, code)) {
+			return true
+		}
+		for _, k := range s.cfg.PreviousCodeKeys {
+			if secret.Equal(hash, secret.HMAC(k, user.ID+":"+code)) {
+				return true
+			}
+		}
+		return false
 	})
 	if errors.Is(err, store.ErrNotFound) || (err == nil && !ok) {
 		return ErrInvalidCredentials
@@ -247,9 +258,15 @@ type PasswordReset struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// StartPasswordReset issues a single-use reset token for a human user. For an
-// unknown login name it returns nil without error, so the end user always
-// sees the same "if the account exists, we sent an email" message.
+// StartPasswordReset issues a single-use reset token for a human user. It
+// returns nil without error for unknown, machine and locked users and while
+// the per-user cooldown is active, so the response never reveals whether an
+// account exists (audit L1). Earlier tokens stay valid (audit L2).
+//
+// Trust note (audit D3): the token is handed to the calling login backend,
+// which emails it. Any login-scoped key can therefore reset passwords of the
+// users in its scope; login keys must only be given to backends you trust
+// with account recovery.
 func (s *Service) StartPasswordReset(ctx context.Context, c Client, orgID, loginName string) (*PasswordReset, error) {
 	user, err := s.store.FindUserForLogin(ctx, orgID, loginName)
 	if errors.Is(err, store.ErrNotFound) {
@@ -264,7 +281,7 @@ func (s *Service) StartPasswordReset(ctx context.Context, c Client, orgID, login
 	expires := time.Now().Add(passwordResetLifetime)
 	if err := s.store.CreatePasswordReset(ctx, user.ID, secret.Hash(token), expires); err != nil {
 		if errors.Is(err, store.ErrTooSoon) {
-			return nil, ErrRateLimited
+			return nil, nil // same answer as an unknown user
 		}
 		return nil, err
 	}
@@ -272,9 +289,10 @@ func (s *Service) StartPasswordReset(ctx context.Context, c Client, orgID, login
 	return &PasswordReset{Token: token, Email: user.Email, ExpiresAt: expires}, nil
 }
 
-// ConfirmPasswordReset sets a new password with a reset token. All sessions
-// and tokens are revoked and any failed-login lockout is cleared. If allowOrg
-// is set, the token must belong to a user of that org.
+// ConfirmPasswordReset sets a new password with a reset token. In one
+// transaction the token is consumed, the password set, and every session,
+// token and other reset token of the user ended. Locked and machine users are
+// refused (audit M12). For an org-scoped key the token must belong to that org.
 func (s *Service) ConfirmPasswordReset(ctx context.Context, c Client, token, password string) error {
 	if len(token) > 128 {
 		return ErrInvalidCredentials
@@ -291,23 +309,17 @@ func (s *Service) ConfirmPasswordReset(ctx context.Context, c Client, token, pas
 	if err != nil {
 		return err
 	}
-	if c.OrgID != "" && c.OrgID != user.OrgID {
+	if (c.OrgID != "" && c.OrgID != user.OrgID) || user.Locked || user.Kind != store.KindHuman {
 		return ErrInvalidCredentials
 	}
 	hash, err := s.HashPassword(password, user.Username, user.Email)
 	if err != nil {
-		return err
+		return err // the token is not used up by a rejected password
 	}
-	if _, err := s.store.ConsumePasswordReset(ctx, secret.Hash(token)); err != nil {
-		return ErrInvalidCredentials // used concurrently
-	}
-	if err := s.store.SetPasswordHash(ctx, user.ID, hash); err != nil {
-		return err
-	}
-	if err := s.store.RevokeUserTokens(ctx, user.ID); err != nil {
-		return err
-	}
-	if err := s.store.ClearTemporaryLockout(ctx, user.ID); err != nil {
+	if err := s.store.CompletePasswordReset(ctx, secret.Hash(token), user.ID, hash); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInvalidCredentials // used concurrently, or the user was locked meanwhile
+		}
 		return err
 	}
 	s.audit(ctx, c, user, "user.password_reset", nil)
@@ -455,8 +467,8 @@ func (s *Service) CheckTOTP(ctx context.Context, c Client, id, token, code strin
 	if err != nil {
 		return nil, err
 	}
-	if sess.PasswordCheckedAt == nil || user == nil {
-		return nil, ErrNotAuthenticated // password first, so TOTP cannot be probed alone
+	if (sess.PasswordCheckedAt == nil && sess.IDPCheckedAt == nil) || user == nil {
+		return nil, ErrNotAuthenticated // a first factor first, so TOTP cannot be probed alone
 	}
 	if !user.TOTPVerified {
 		return nil, ErrTOTPNotEnrolled
@@ -554,14 +566,30 @@ func (s *Service) state(sess *store.Session, user *store.User) *SessionState {
 		st.MFARequired = user.MFARequired()
 	}
 	// A session is authenticated by one of: a user-verified passkey (phishing
-	// resistant, counts as multi-factor), a federated login (the org's IdP is
-	// responsible for its MFA), or the password plus TOTP when enrolled.
+	// resistant, counts as multi-factor), a federated login (plus TOTP when
+	// enrolled, unless the IdP is trusted for MFA), or the password plus TOTP
+	// when enrolled.
 	var at *time.Time
 	switch {
 	case st.PasskeyChecked:
-		at, st.AMR = sess.PasskeyCheckedAt, []string{"hwk", "user", "mfa"}
-	case st.IDPChecked:
+		// Synced (backup-eligible) passkeys are not bound to one device (audit L8).
+		keyKind := "hwk"
+		if sess.PasskeySynced {
+			keyKind = "swk"
+		}
+		at, st.AMR = sess.PasskeyCheckedAt, []string{keyKind, "user", "mfa"}
+	case st.IDPChecked && sess.IDPTrustMFA:
+		// An instance admin trusts this IdP to enforce MFA (audit D1).
+		at, st.AMR = sess.IDPCheckedAt, []string{"fed", "mfa"}
+	case st.IDPChecked && (!st.MFARequired || st.TOTPChecked):
+		// Otherwise users who enrolled TOTP must still enter it after SSO.
 		at, st.AMR = sess.IDPCheckedAt, []string{"fed"}
+		if st.TOTPChecked {
+			st.AMR = append(st.AMR, "otp", "mfa")
+			if sess.TOTPCheckedAt.After(*at) {
+				at = sess.TOTPCheckedAt
+			}
+		}
 	case st.PasswordChecked && (!st.MFARequired || st.TOTPChecked):
 		at, st.AMR = sess.PasswordCheckedAt, []string{"pwd"}
 		if st.TOTPChecked {

@@ -42,10 +42,16 @@ func (s *Store) AddPasskey(ctx context.Context, id, userID, name string, credent
 	return mapErr(err)
 }
 
-// UpdatePasskeyUse stores the credential after a login (new sign counter).
-func (s *Store) UpdatePasskeyUse(ctx context.Context, id string, credential []byte) error {
-	return s.execOne(ctx,
-		`UPDATE webauthn_credentials SET credential = $2, last_used_at = now() WHERE id = $1`, id, credential)
+// UpdatePasskeyUse stores the credential after a login. With a non-zero
+// signature counter the update only succeeds if the counter grew since the
+// stored value (compare-and-swap), so two concurrent logins cannot both reuse
+// one counter value (audit L9); ErrNotFound means the counter was stale.
+// Authenticators that always report 0 (synced passkeys) are not counted.
+func (s *Store) UpdatePasskeyUse(ctx context.Context, id string, credential []byte, signCount uint32) error {
+	return s.execOne(ctx, `
+		UPDATE webauthn_credentials SET credential = $2, last_used_at = now()
+		WHERE id = $1 AND ($3::bigint = 0 OR coalesce((credential->'authenticator'->>'signCount')::bigint, 0) < $3::bigint)`,
+		id, credential, int64(signCount))
 }
 
 func (s *Store) DeletePasskey(ctx context.Context, userID, id string) error {

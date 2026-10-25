@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -63,8 +65,24 @@ func (s *Service) relyingParty(ctx context.Context, idp *store.IDP) (rp.RelyingP
 	)
 }
 
+// ErrBadBinding means the browser binding is missing or too weak.
+var ErrBadBinding = WeakPasswordError("browser_binding must be 43 to 512 characters of random data from the login UI's cookie")
+
+// ErrUnsafeIdP means an IdP advertised an endpoint the engine refuses to use.
+var ErrUnsafeIdP = errors.New("identity provider advertises an unsafe endpoint")
+
 // StartFederatedLogin creates a login intent for one of the org's IdPs.
-func (s *Service) StartFederatedLogin(ctx context.Context, orgID, idpID, returnURL string) (*FederationStart, error) {
+//
+// browserBinding is a random secret (at least 256 bits, e.g. 32 random bytes
+// base64url) that the login UI stores in an HttpOnly, Secure, SameSite=Lax
+// cookie on its own origin before redirecting to the IdP. Redemption must
+// present the same value, read from the cookie of the browser that returns,
+// so a callback URL captured by an attacker cannot log a victim's browser
+// into the attacker's account (login CSRF, audit M3).
+func (s *Service) StartFederatedLogin(ctx context.Context, orgID, idpID, returnURL, browserBinding string) (*FederationStart, error) {
+	if len(browserBinding) < 43 || len(browserBinding) > 512 {
+		return nil, ErrBadBinding
+	}
 	idp, err := s.store.GetIDP(ctx, idpID)
 	if err != nil || idp.OrgID != orgID {
 		return nil, store.ErrNotFound
@@ -72,6 +90,14 @@ func (s *Service) StartFederatedLogin(ctx context.Context, orgID, idpID, returnU
 	party, err := s.relyingParty(ctx, idp)
 	if err != nil {
 		return nil, fmt.Errorf("identity provider unavailable: %w", err)
+	}
+	// The discovery document is tenant-controlled: check every endpoint the
+	// engine or the user's browser will be sent to (audit M4).
+	endpoint := party.OAuthConfig().Endpoint
+	for _, u := range []string{endpoint.AuthURL, endpoint.TokenURL, party.UserinfoEndpoint()} {
+		if u != "" && !SafeIdPURL(u, s.cfg.DevMode) {
+			return nil, fmt.Errorf("%w: %s", ErrUnsafeIdP, u)
+		}
 	}
 	state, nonce, verifier := secret.Token(32), secret.Token(32), secret.Token(32)
 	challenge := sha256.Sum256([]byte(verifier))
@@ -82,15 +108,38 @@ func (s *Service) StartFederatedLogin(ctx context.Context, orgID, idpID, returnU
 		Nonce:           nonce,
 		CodeVerifierEnc: s.box.Seal([]byte(verifier)),
 		ReturnURL:       returnURL,
+		BindingHash:     secret.Hash(browserBinding),
 		ExpiresAt:       time.Now().Add(intentLifetime),
-	}
-	if err := s.store.CreateIntent(ctx, intent); err != nil {
-		return nil, err
 	}
 	authURL := rp.AuthURL(state, party,
 		rp.WithCodeChallenge(base64.RawURLEncoding.EncodeToString(challenge[:])),
 		rp.AuthURLOpt(rp.WithURLParam("nonce", nonce)))
+	if !SafeIdPURL(authURL, s.cfg.DevMode) {
+		return nil, fmt.Errorf("%w: %s", ErrUnsafeIdP, authURL)
+	}
+	if err := s.store.CreateIntent(ctx, intent); err != nil {
+		return nil, err
+	}
 	return &FederationStart{IntentID: intent.ID, AuthURL: authURL}, nil
+}
+
+// SafeIdPURL accepts absolute https URLs with a host and no embedded
+// credentials or fragment; plain http only in dev mode. It is used for every
+// endpoint taken from an IdP's discovery document and for the authorization
+// URL handed to the login UI, which must never be javascript:, data: or similar.
+func SafeIdPURL(raw string, devMode bool) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" || len(raw) > 4096 {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		return devMode
+	default:
+		return false
+	}
 }
 
 // HandleCallback completes the IdP round trip and returns where to send the
@@ -153,8 +202,14 @@ func (s *Service) HandleCallback(ctx context.Context, state, code, idpError stri
 }
 
 // resolveFederatedUser finds the local user for an external identity: an
-// existing link, else (if allowed) an existing user with the same verified
-// email, else (if allowed) a new user.
+// existing link (by IdP and subject, never by email), else (if allowed) an
+// existing user with the same verified email, else (if allowed) a new user.
+//
+// The IdP is configured by the tenant, so its email claims are only trusted
+// when an instance admin set trust_email: otherwise new users get an
+// unverified email and no account is linked by email (audit M2). The email
+// domain allowlist only limits who may be provisioned or linked; it is never
+// treated as proof of identity (audit M11).
 func (s *Service) resolveFederatedUser(ctx context.Context, idp *store.IDP, claims *oidc.IDTokenClaims) (*store.User, error) {
 	user, err := s.store.FindIdentity(ctx, idp.ID, claims.Subject)
 	if err == nil {
@@ -169,9 +224,21 @@ func (s *Service) resolveFederatedUser(ctx context.Context, idp *store.IDP, clai
 		return nil, err
 	}
 
-	email := strings.TrimSpace(claims.Email)
-	verified := bool(claims.EmailVerified)
-	if idp.LinkByEmail && email != "" && verified {
+	email := strings.ToLower(strings.TrimSpace(claims.Email))
+	if !ValidEmail(email) {
+		email = ""
+	}
+	// IdP-asserted verification, honoured only for IdPs an instance admin trusts.
+	verified := email != "" && bool(claims.EmailVerified) && idp.TrustEmail
+	if len(idp.AllowedEmailDomains) > 0 {
+		// Only identities with an IdP-verified email in an allowed domain may
+		// be provisioned or linked; the subject remains the identity.
+		_, domain, _ := strings.Cut(email, "@")
+		if email == "" || !bool(claims.EmailVerified) || !slices.Contains(idp.AllowedEmailDomains, domain) {
+			return nil, ErrNoAccount
+		}
+	}
+	if idp.LinkByEmail && verified {
 		if existing, err := s.store.FindUserForLogin(ctx, idp.OrgID, email); err == nil {
 			if err := s.store.LinkIdentity(ctx, idp.ID, claims.Subject, existing.ID); err != nil {
 				return nil, err
@@ -182,13 +249,13 @@ func (s *Service) resolveFederatedUser(ctx context.Context, idp *store.IDP, clai
 	if !idp.AutoCreateUsers {
 		return nil, ErrNoAccount
 	}
-	if email == "" || !strings.Contains(email, "@") {
+	if email == "" {
 		sum := sha256.Sum256([]byte(idp.ID + "\x00" + claims.Subject))
-		email, verified = "idp-"+hex.EncodeToString(sum[:8])+"@idp.invalid", false
+		email = "idp-" + hex.EncodeToString(sum[:8]) + "@idp.invalid"
 	}
 	created, err := s.store.CreateUser(ctx, store.NewUser{
 		OrgID: idp.OrgID, Username: email, Email: email, EmailVerified: verified,
-		GivenName: truncate(claims.GivenName, 100), FamilyName: truncate(claims.FamilyName, 100),
+		GivenName: cleanName(claims.GivenName), FamilyName: cleanName(claims.FamilyName),
 	})
 	if err != nil {
 		// Most likely a local user already has this email; an admin must link it.
@@ -200,9 +267,19 @@ func (s *Service) resolveFederatedUser(ctx context.Context, idp *store.IDP, clai
 	return created, nil
 }
 
-// RedeemFederatedLogin exchanges a completed intent for an authenticated session.
-func (s *Service) RedeemFederatedLogin(ctx context.Context, c Client, intentID, code string) (*SessionState, error) {
-	userID, _, err := s.store.RedeemIntent(ctx, intentID, secret.Hash(code))
+// RedeemFederatedLogin exchanges a completed intent for an authenticated
+// session. browserBinding must be the value given to StartFederatedLogin,
+// read from the returning browser's cookie; otherwise the intent is used up
+// and refused (audit M3).
+func (s *Service) RedeemFederatedLogin(ctx context.Context, c Client, intentID, code, browserBinding string) (*SessionState, error) {
+	userID, idpID, bindingHash, err := s.store.RedeemIntent(ctx, intentID, secret.Hash(code))
+	if err != nil {
+		return nil, ErrInvalidCredentials
+	}
+	if bindingHash == "" || !secret.Equal(bindingHash, secret.Hash(browserBinding)) {
+		return nil, ErrInvalidCredentials
+	}
+	idp, err := s.store.GetIDP(ctx, idpID)
 	if err != nil {
 		return nil, ErrInvalidCredentials
 	}
@@ -222,7 +299,7 @@ func (s *Service) RedeemFederatedLogin(ctx context.Context, c Client, intentID, 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.store.MarkSessionIDP(ctx, sess.ID); err != nil {
+	if err := s.store.MarkSessionIDP(ctx, sess.ID, idp.TrustMFA); err != nil {
 		return nil, err
 	}
 	st, err := s.GetSession(ctx, c, sess.ID, token)
@@ -253,36 +330,87 @@ func truncate(v string, n int) string {
 	return v
 }
 
+// ValidEmail is a conservative syntax check for email addresses taken from
+// external claims: one @, a non-empty local part, a dotted domain of DNS
+// labels, no whitespace or control characters, at most 254 bytes.
+func ValidEmail(email string) bool {
+	if len(email) > 254 || strings.ContainsFunc(email, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
+		return false
+	}
+	local, domain, ok := strings.Cut(email, "@")
+	if !ok || local == "" || len(local) > 64 || strings.Contains(domain, "@") {
+		return false
+	}
+	return ValidDomain(domain) && strings.Contains(domain, ".")
+}
+
+// ValidDomain checks a DNS name: 1-253 bytes, labels of 1-63 letters, digits
+// and hyphens, not starting or ending with a hyphen. No wildcards.
+func ValidDomain(domain string) bool {
+	if domain == "" || len(domain) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// cleanName bounds names from external claims and drops control characters.
+func cleanName(v string) string {
+	v = strings.Map(func(r rune) rune {
+		if r < ' ' || r == 0x7f {
+			return -1
+		}
+		return r
+	}, v)
+	return truncate(strings.TrimSpace(v), 100)
+}
+
 // NewOutboundClient returns the HTTP client used to talk to external IdPs.
 // Unless allowPrivate is set (dev mode), it refuses to connect to loopback,
 // private and link-local addresses: org admins choose the issuer URL, and
 // must not be able to make the engine probe the internal network (SSRF).
 // The check runs on the resolved address, so DNS tricks do not bypass it.
-func NewOutboundClient(allowPrivate bool) *http.Client {
+//
+// Outside dev mode it also only speaks https (every hop, including redirects
+// and endpoints taken from discovery) and caps response bodies (audit M4, L4).
+func NewOutboundClient(devMode bool) *http.Client {
 	dialer := &net.Dialer{
 		Timeout: 5 * time.Second,
 		Control: func(network, address string, _ syscall.RawConn) error {
-			if allowPrivate {
+			if devMode {
 				return nil
 			}
 			host, _, err := net.SplitHostPort(address)
 			if err != nil {
 				return err
 			}
-			ip := net.ParseIP(host)
-			if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-				ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
-				return fmt.Errorf("refusing to connect to internal address %s", host)
+			addr, err := netip.ParseAddr(host)
+			if err != nil || !PublicAddress(addr) {
+				return fmt.Errorf("refusing to connect to non-public address %s", host)
 			}
 			return nil
 		},
 	}
 	return &http.Client{
 		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext:         dialer.DialContext,
-			TLSHandshakeTimeout: 5 * time.Second,
-			MaxIdleConns:        20,
+		Transport: &guardedTransport{
+			allowHTTP: devMode,
+			base: &http.Transport{
+				DialContext:            dialer.DialContext,
+				TLSHandshakeTimeout:    5 * time.Second,
+				ResponseHeaderTimeout:  5 * time.Second,
+				MaxIdleConns:           20,
+				MaxResponseHeaderBytes: 64 << 10,
+			},
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 3 {
@@ -291,4 +419,69 @@ func NewOutboundClient(allowPrivate bool) *http.Client {
 			return nil
 		},
 	}
+}
+
+// maxIdPResponse caps the bytes read from an IdP response (discovery, JWKS,
+// token, userinfo); real responses are a few kilobytes.
+const maxIdPResponse = 1 << 20
+
+// guardedTransport refuses non-https requests (unless allowHTTP) and caps
+// response bodies. Redirects pass through RoundTrip too, so they are checked.
+type guardedTransport struct {
+	base      http.RoundTripper
+	allowHTTP bool
+}
+
+func (t *guardedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != "https" && !(t.allowHTTP && req.URL.Scheme == "http") {
+		return nil, fmt.Errorf("refusing non-https request to %s", req.URL.Host)
+	}
+	resp, err := t.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = http.MaxBytesReader(nil, resp.Body, maxIdPResponse)
+	return resp, nil
+}
+
+// nonPublicPrefixes are ranges that are not reachable public internet hosts,
+// beyond what netip's classification already covers (audit L4).
+var nonPublicPrefixes = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, p := range []string{
+		"0.0.0.0/8",       // "this network"
+		"100.64.0.0/10",   // carrier-grade NAT; includes Alibaba Cloud metadata 100.100.100.200
+		"192.0.0.0/24",    // IETF protocol assignments
+		"192.0.2.0/24",    // documentation
+		"198.18.0.0/15",   // benchmarking
+		"198.51.100.0/24", // documentation
+		"203.0.113.0/24",  // documentation
+		"240.0.0.0/4",     // reserved, includes broadcast
+		"64:ff9b::/96",    // NAT64 (embeds an IPv4 address)
+		"64:ff9b:1::/48",  // local NAT64
+		"100::/64",        // discard
+		"2001::/32",       // Teredo (embeds an IPv4 address)
+		"2001:db8::/32",   // documentation
+		"2002::/16",       // 6to4 (embeds an IPv4 address)
+		"fc00::/7",        // unique local
+	} {
+		out = append(out, netip.MustParsePrefix(p))
+	}
+	return out
+}()
+
+// PublicAddress reports whether addr is a public unicast address the engine
+// may connect to for an IdP. IPv4-mapped IPv6 addresses are checked as IPv4.
+func PublicAddress(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() || addr.IsInterfaceLocalMulticast() || addr.IsUnspecified() {
+		return false
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }

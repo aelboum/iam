@@ -19,6 +19,10 @@ type Session struct {
 	TOTPCheckedAt     *time.Time
 	PasskeyCheckedAt  *time.Time
 	IDPCheckedAt      *time.Time
+	// IDPTrustMFA: the IdP is trusted to have enforced MFA (instance admin policy).
+	IDPTrustMFA bool
+	// PasskeySynced: the passkey is backup-eligible (synced), not hardware-bound.
+	PasskeySynced bool
 	// WebAuthnSession holds a pending passkey challenge (library session data).
 	WebAuthnSession []byte
 	CreatedAt       time.Time
@@ -26,12 +30,13 @@ type Session struct {
 }
 
 const sessionColumns = `id, token_hash, org_id, user_id, login_name, password_checked_at, totp_checked_at,
-	passkey_checked_at, idp_checked_at, webauthn_session, created_at, expires_at`
+	passkey_checked_at, idp_checked_at, idp_trust_mfa, passkey_synced, webauthn_session, created_at, expires_at`
 
 func scanSession(row interface{ Scan(...any) error }) (*Session, error) {
 	var s Session
 	if err := row.Scan(&s.ID, &s.TokenHash, &s.OrgID, &s.UserID, &s.LoginName, &s.PasswordCheckedAt,
-		&s.TOTPCheckedAt, &s.PasskeyCheckedAt, &s.IDPCheckedAt, &s.WebAuthnSession, &s.CreatedAt, &s.ExpiresAt); err != nil {
+		&s.TOTPCheckedAt, &s.PasskeyCheckedAt, &s.IDPCheckedAt, &s.IDPTrustMFA, &s.PasskeySynced, &s.WebAuthnSession,
+		&s.CreatedAt, &s.ExpiresAt); err != nil {
 		return nil, mapErr(err)
 	}
 	return &s, nil
@@ -70,6 +75,6 @@ func (s *Store) SetSessionChallenge(ctx context.Context, id string, challenge []
 }
 
 // MarkSessionPasskey records a verified passkey and consumes the challenge.
-func (s *Store) MarkSessionPasskey(ctx context.Context, id string) error {
-	return s.execOne(ctx, `UPDATE sessions SET passkey_checked_at = now(), webauthn_session = NULL WHERE id = $1`, id)
+func (s *Store) MarkSessionPasskey(ctx context.Context, id string, synced bool) error {
+	return s.execOne(ctx, `UPDATE sessions SET passkey_checked_at = now(), passkey_synced = $2, webauthn_session = NULL WHERE id = $1`, id, synced)
 }

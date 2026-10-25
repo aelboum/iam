@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
@@ -368,12 +369,22 @@ func (s *Storage) GetClientByClientID(ctx context.Context, clientID string) (op.
 	return &client{app}, nil
 }
 
+// AuthorizeClientIDSecret authenticates apps, and machine users so they can
+// revoke their own tokens (audit L6). A machine user gains nothing else from
+// it: the code and refresh grants look the client up with GetClientByClientID,
+// which only knows apps, and introspection only answers apps.
 func (s *Storage) AuthorizeClientIDSecret(ctx context.Context, clientID, clientSecret string) error {
-	app, err := s.store.GetAppByClientID(ctx, clientID)
-	if err != nil || app.ClientSecretHash == nil || !s.authn.VerifySecret(*app.ClientSecretHash, clientSecret) {
+	if app, err := s.store.GetAppByClientID(ctx, clientID); err == nil {
+		if app.ClientSecretHash != nil && s.authn.VerifySecret(*app.ClientSecretHash, clientSecret) {
+			return nil
+		}
 		return oidc.ErrInvalidClient().WithDescription("invalid client credentials")
 	}
-	return nil
+	if m, err := s.store.GetMachineUserByClientID(ctx, clientID); err == nil && !m.Locked &&
+		m.ClientSecretHash != nil && s.authn.VerifySecret(*m.ClientSecretHash, clientSecret) {
+		return nil
+	}
+	return oidc.ErrInvalidClient().WithDescription("invalid client credentials")
 }
 
 // --- claims ----------------------------------------------------------------------------------
@@ -565,8 +576,12 @@ func (s *Storage) ClientCredentialsTokenRequest(ctx context.Context, clientID st
 	if err != nil {
 		return nil, oidc.ErrInvalidClient()
 	}
+	granted, err := MachineScopes(scopes)
+	if err != nil {
+		return nil, oidc.ErrInvalidScope().WithDescription("%s", err.Error())
+	}
 	// A project scope is only honoured if the machine user's org can use the project.
-	if projectID := projectFromScopes(scopes); projectID != "" {
+	if projectID := projectFromScopes(granted); projectID != "" {
 		if _, allowed, err := s.store.AvailableRoles(ctx, projectID, user.OrgID); err != nil || !allowed {
 			return nil, oidc.ErrInvalidScope().WithDescription("no access to the requested project")
 		}
@@ -574,9 +589,35 @@ func (s *Storage) ClientCredentialsTokenRequest(ctx context.Context, clientID st
 	return &oidc.JWTTokenRequest{
 		Subject:  user.ID,
 		Audience: []string{clientID},
-		Scopes:   scopes,
+		Scopes:   granted, // only what was validated is stored, issued and introspected
 		IssuedAt: oidc.FromTime(time.Now()),
 	}, nil
+}
+
+// MachineScopes validates the scopes of a client credentials request (audit
+// M1): the only supported scope is one project scope "urn:iam:project:<uuid>".
+// Anything else, a second project scope or a malformed id is refused, so a
+// token never carries a scope that was not authorized.
+func MachineScopes(requested []string) ([]string, error) {
+	granted := []string{}
+	for _, scope := range requested {
+		if scope == "" {
+			continue
+		}
+		projectID, ok := strings.CutPrefix(scope, ProjectScopePrefix)
+		if !ok {
+			return nil, fmt.Errorf("unsupported scope %q: machine users may only request %s<project id>", scope, ProjectScopePrefix)
+		}
+		id, err := uuid.Parse(projectID)
+		if err != nil || id.String() != projectID {
+			return nil, fmt.Errorf("invalid project id in scope %q", scope)
+		}
+		if len(granted) > 0 {
+			return nil, errors.New("at most one project scope may be requested")
+		}
+		granted = append(granted, scope)
+	}
+	return granted, nil
 }
 
 // machineAccessToken stores the access token for a client credentials request.
