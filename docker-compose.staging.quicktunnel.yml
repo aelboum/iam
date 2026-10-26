@@ -1,0 +1,45 @@
+# Option B (Quick Tunnel variant): a TEMPORARY, tokenless Cloudflare Quick Tunnel
+# for IAM staging — HTTPS without owning a domain, a Cloudflare account token, or
+# any DNS configuration. Cloudflare assigns a RANDOM https://<random>.trycloudflare.com
+# hostname that changes on every (re)start.
+#
+# Use it ON TOP OF the base bundle, and NEVER together with
+# docker-compose.staging.tunnel.yml (the token-based variant) — pick exactly one
+# tunnel variant. Caddy and host ports 80/443 are not started; TLS terminates at
+# the Cloudflare edge; cloudflared makes OUTBOUND 443 connections only and
+# forwards to the engine privately at http://iam:8080. Postgres and the engine
+# stay private — no host port is published.
+#
+# Two-phase bring-up (see docs/STAGING.md "Quick Tunnel"): start ONLY cloudflared
+# first to learn the random hostname, then set IAM_DOMAIN to it and start the
+# engine + Postgres.
+#
+# Same project name as the base so volumes/teardown stay unified.
+name: iam-staging
+
+services:
+  # Not used in tunnel mode; profiled out so a plain `up` never starts it and no
+  # host port is bound. The base file is left unchanged.
+  caddy:
+    profiles: ["hostport-only"]
+
+  # The engine and Postgres are inherited unchanged from the base (engine
+  # expose: ["8080"], no published ports; Postgres has no ports mapping).
+
+  cloudflared:
+    # Deliberately pinned, matured release (past the 2026.8.0/8.1 HTTP-origin
+    # path-normalization bugs; our origin is http://iam:8080). Re-check before use.
+    image: cloudflare/cloudflared:2026.9.3
+    restart: unless-stopped
+    # Quick Tunnel: anonymous, tokenless. Cloudflare prints a random
+    # *.trycloudflare.com URL to the container log on start. NO token is used and
+    # none of the existing tunnel's credentials are referenced.
+    command: ["tunnel", "--no-autoupdate", "--url", "http://iam:8080"]
+    # No TUNNEL_TOKEN here by design.
+    # No depends_on: in phase A cloudflared starts ALONE (the tunnel/URL comes up
+    # independently of the origin; requests just 502 until the engine is started
+    # in phase B).
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]

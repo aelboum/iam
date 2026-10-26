@@ -383,6 +383,96 @@ docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.ym
   dashboard. The existing `vps-ai-pbx` tunnel and both existing stacks are never
   touched.
 
+## Quick Tunnel (temporary HTTPS, no domain / no token / no DNS)
+
+For a short ad-hoc HTTPS test with no owned domain, no Cloudflare account token,
+and no DNS setup, use the **Quick Tunnel** variant
+(`docker-compose.staging.quicktunnel.yml`). Cloudflare assigns a **random
+`https://<random>.trycloudflare.com` hostname that changes on every (re)start**.
+
+> **Temporary, non-production only.** This hostname is ephemeral and
+> unauthenticated at the edge. Use it only for a single short test with
+> **synthetic test data** — never real user data or production secrets. A new
+> hostname (any tunnel restart) invalidates the `IAM_ISSUER` and every OAuth
+> redirect URI you registered, so logins will fail until you re-register. Do not
+> use for anything that must persist or for production.
+>
+> **Public-exposure warning.** A Quick Tunnel publishes the engine on a public
+> HTTPS URL that anyone with the link can reach. Keep the session short, keep
+> `IAM_BOOTSTRAP_ADMIN_KEY` strong and staging-only, tear it down promptly, and
+> never point it at anything but a disposable staging stack.
+
+Pick **exactly one** tunnel variant — use this file **or**
+`docker-compose.staging.tunnel.yml`, never both at once (both define
+`cloudflared` and profile Caddy out).
+
+### Phase A — start only the tunnel, learn the hostname
+
+```
+# Starts ONLY cloudflared (no token needed). The engine is not up yet; that is
+# fine — the tunnel URL comes up independently and requests 502 until phase B.
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.quicktunnel.yml \
+  --env-file .env.staging up -d cloudflared
+
+# Read the generated hostname from the container log (no secrets are printed):
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.quicktunnel.yml \
+  logs cloudflared | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1
+```
+
+### Phase B — set IAM_DOMAIN to that hostname, then start IAM + Postgres
+
+Set these in `.env.staging` to the **exact** hostname from Phase A (host only,
+no scheme, for the two WebAuthn values):
+
+```
+IAM_DOMAIN=<random>.trycloudflare.com
+IAM_WEBAUTHN_RP_ID=<random>.trycloudflare.com
+IAM_WEBAUTHN_ORIGINS=https://<random>.trycloudflare.com
+```
+
+```
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.quicktunnel.yml \
+  --env-file .env.staging up -d iam postgres
+```
+
+`IAM_ISSUER` is then `https://<random>.trycloudflare.com` (base compose line 47),
+the OIDC discovery `issuer`, the federation callback `{issuer}/idp/callback`
+(`internal/authn/federation.go:44`), and the WebAuthn origin all resolve to that
+same hostname. Verify consistency with the live-issuer check from the base
+runbook against `https://<IAM_DOMAIN>` — it must report exactly
+`"issuer":"https://<random>.trycloudflare.com"`.
+
+### Provider redirect URIs (manual, after Phase A)
+
+Once the hostname is known, add
+`https://<random>.trycloudflare.com/idp/callback` as a redirect URI on the
+**Google** OAuth client and the **Entra** app registration (Web platform). If the
+tunnel restarts and the hostname changes, these must be **re-registered** or the
+federated logins fail.
+
+### Pre-teardown verification and teardown (iam-staging only)
+
+Preserve any backup off the VM first. Then confirm every object to be removed
+belongs to `iam-staging`; if any `vps-ai-pbx`, `zitadel-stack`, or unexpected
+object appears, **stop and investigate**:
+
+```
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.quicktunnel.yml ps -a
+docker volume ls  --filter label=com.docker.compose.project=iam-staging
+docker network ls --filter label=com.docker.compose.project=iam-staging
+```
+
+Only once every listed object is `iam-staging`:
+
+```
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.quicktunnel.yml \
+  --env-file .env.staging down -v
+```
+
+The Quick Tunnel has no account/DNS state, so it simply disappears when
+cloudflared stops — nothing to delete in Cloudflare. No `docker prune`, no broad
+wildcards, and no other Compose project is touched.
+
 ## Go / no-go
 
 Staging is complete for pre-production only when steps 1–4 pass with retained
