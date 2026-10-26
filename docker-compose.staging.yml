@@ -1,0 +1,97 @@
+# Ephemeral WS9 staging stack: Caddy terminates TLS (automatic Let's Encrypt)
+# and forwards to the engine; Postgres is reachable only inside the network and
+# is never published. This mirrors docker-compose.prod.yml but is meant to be
+# stood up on a disposable host, exercised, and torn down (see docs/STAGING.md).
+# It is NOT production: use fresh staging-only keys and no real user data.
+#
+#   cp .env.staging.example .env.staging   # fill in every value (gitignored)
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging up -d --build
+#
+# Teardown (removes ONLY this stack's containers, network, and volumes):
+#   docker compose -f docker-compose.staging.yml --env-file .env.staging down -v
+#
+# The top-level name pins every container/network/volume to the `iam-staging`
+# project prefix, so teardown and inspection target exactly this stack.
+name: iam-staging
+
+services:
+  caddy:
+    image: caddy:2.8.4-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      IAM_DOMAIN: ${IAM_DOMAIN:?set IAM_DOMAIN}
+    volumes:
+      # Reuse the production Caddyfile unchanged (same edge hardening: HSTS,
+      # /docs refused, X-Forwarded-Proto set). No staging-specific copy, so the
+      # TLS/edge security logic is not duplicated or allowed to drift.
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      iam:
+        condition: service_healthy
+
+  iam:
+    build: .
+    restart: unless-stopped
+    environment:
+      IAM_ISSUER: https://${IAM_DOMAIN:?set IAM_DOMAIN}
+      IAM_DATABASE_URL: postgres://iam:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/iam?sslmode=disable
+      IAM_MASTER_KEY: ${IAM_MASTER_KEY:?set IAM_MASTER_KEY}
+      IAM_BOOTSTRAP_ADMIN_KEY: ${IAM_BOOTSTRAP_ADMIN_KEY:-}
+      # Dev mode OFF: the whole point of staging. The engine then refuses an
+      # http or private issuer and requires the https IAM_ISSUER above.
+      IAM_DEV_MODE: "false"
+      IAM_ENABLE_DOCS: "false"
+      # Caddy sets the real client IP in one proxy hop.
+      IAM_TRUST_PROXY: "true"
+      IAM_TRUSTED_PROXY_HOPS: "1"
+      IAM_SHARED_RATE_LIMITS: "true"
+      IAM_WEBAUTHN_RP_ID: ${IAM_WEBAUTHN_RP_ID:-}
+      IAM_WEBAUTHN_ORIGINS: ${IAM_WEBAUTHN_ORIGINS:-}
+    # No published ports: only Caddy (inside the network) can reach the engine.
+    expose: ["8080"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      # Distroless image has no shell/curl; the binary probes /healthz itself.
+      test: ["CMD", "/iamd", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    # Dedicated Postgres 17 for staging only; never published to the host.
+    image: postgres:17.2-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: iam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: iam
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Intentionally no `ports:` mapping — database access stays inside the
+    # compose network. Reach it for backups via `docker compose exec postgres`.
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iam"]
+      interval: 5s
+      retries: 20
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

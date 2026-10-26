@@ -96,6 +96,102 @@ Decide and prove these in staging, not during a production incident:
 - **Rehearse the restore** with the environment's real backup tooling (step 6),
   and record the measured restore time so an incident has a known bound.
 
+## Ephemeral VM runbook (the committed staging bundle)
+
+The reviewable bundle is `docker-compose.staging.yml` (project name
+`iam-staging`), the reused `deploy/Caddyfile`, and `.env.staging.example`. It
+brings up Caddy (auto-TLS) + the engine (dev mode off) + a dedicated, unpublished
+Postgres 17. Everything below runs on the disposable host; nothing is provisioned
+from this repository.
+
+### Remaining manual steps (operator, on the VM)
+
+1. **Create a small disposable VM** (1 vCPU / 1 GB is enough), with inbound
+   80/443 open and SSH restricted to your IP. Install Docker Engine + compose.
+2. **DNS / hostname.** Point a hostname at the VM's public IP (an `A`/`AAAA`
+   record), or use a provider hostname. This value is `IAM_DOMAIN`.
+3. **Clone the repo** on the VM and `cp .env.staging.example .env.staging`.
+4. **Inject staging-only secrets** into `.env.staging` (or the host secret
+   store): `IAM_MASTER_KEY=$(openssl rand -base64 32)`,
+   `POSTGRES_PASSWORD=$(openssl rand -hex 32)`,
+   `IAM_BOOTSTRAP_ADMIN_KEY=$(openssl rand -hex 32)`, and set `IAM_DOMAIN`,
+   `IAM_WEBAUTHN_RP_ID`, `IAM_WEBAUTHN_ORIGINS`. Never reuse a production value;
+   never commit the filled file.
+5. **Add the HTTPS redirect URI** `https://<IAM_DOMAIN>/idp/callback` to the
+   **Google** OAuth client and the **Entra** app registration (Web platform),
+   alongside the existing local one. (Operator action in each provider console —
+   not done from here.)
+6. **Start:** `docker compose -f docker-compose.staging.yml --env-file .env.staging up -d --build`.
+
+### Startup and health checks (capture output as evidence)
+
+```
+# Compose file is valid and fully resolved (no secrets echoed beyond your .env):
+docker compose -f docker-compose.staging.yml --env-file .env.staging config -q
+
+# Engine reports healthy (the container healthcheck probes /healthz):
+docker compose -f docker-compose.staging.yml ps
+
+# Dev mode is really off: an http issuer must be refused. This MUST fail to boot:
+docker run --rm -e IAM_DEV_MODE=false -e IAM_ISSUER=http://x -e IAM_MASTER_KEY=x iam-staging-iam \
+  || echo "OK: engine refuses an http issuer when dev mode is off"
+
+# Health and migrations over real HTTPS:
+curl -fsS https://<IAM_DOMAIN>/healthz && echo "  healthz OK"
+docker compose -f docker-compose.staging.yml exec -T postgres \
+  psql -U iam -d iam -c "select version from schema_migrations order by version;"
+```
+
+Then run the live round trips and suites against the staging issuer (see
+`.env.staging.example` harness section and steps 3–5 above):
+`python scripts/smoke_test.py https://<IAM_DOMAIN>` and the Google/Entra
+federation harness pointed at the same issuer.
+
+### Backup, restore, and recovery-time measurement
+
+Database access is private to the compose network; reach it through the
+container. Restore onto an **isolated** target and validate before trusting it.
+
+```
+# Timed backup:
+time docker compose -f docker-compose.staging.yml exec -T postgres \
+  pg_dump -U iam -Fc iam > iam-staging-$(date +%Y%m%d%H%M%S).dump
+
+# Restore onto a SEPARATE scratch database and validate there (never over the live DB):
+docker compose -f docker-compose.staging.yml exec -T postgres \
+  psql -U iam -d postgres -c "create database restore_check;"
+time docker compose -f docker-compose.staging.yml exec -T postgres \
+  pg_restore -U iam -d restore_check --no-owner < iam-staging-<stamp>.dump
+docker compose -f docker-compose.staging.yml exec -T postgres \
+  psql -U iam -d restore_check -c "select count(*) from schema_migrations;"
+```
+
+Record the two `time` figures; their sum is the measured recovery bound for an
+incident. For the migration + upgrade rehearsal (fresh install, backup/restore,
+pre-0007 upgrade) reuse the existing script rather than re-deriving it:
+`scripts/migration_rehearsal.sh` — retain its `ALL_PASS` log.
+
+### Teardown (what exactly gets removed)
+
+```
+# Removes ONLY the iam-staging project's containers, the default network, and the
+# named volumes (pgdata, caddy_data, caddy_config) — nothing else on the host:
+docker compose -f docker-compose.staging.yml --env-file .env.staging down -v
+```
+
+Then **destroy the VM** (and release its static IP / DNS record if created).
+The bundle touches no resource outside the `iam-staging` project; it never
+references the developer stack (`iam-iam`, `iam-postgres`) or any production
+target.
+
+### Cost control
+
+Use the smallest instance that boots the stack; stop or destroy it whenever the
+rehearsal is not actively running (TLS certs and data live in the named volumes,
+but for a disposable run prefer tear-down + rebuild). Let's Encrypt and the
+provider hostname are free; the only running cost is VM compute, which is
+sub-dollar for a few hours. Delete the VM as soon as evidence is captured.
+
 ## Go / no-go
 
 Staging is complete for pre-production only when steps 1–4 pass with retained

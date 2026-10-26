@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 !.env.prod.example
+!.env.staging.example
 /iamd
 examples/demo/.demo-state.json
 *.log
