@@ -14,42 +14,58 @@ them as documented in "Secret injection" below.
 
 ## 1. Entra application registration and test identities (WS7)
 
-- [ ] A dedicated **test Entra directory** (not production), its **Directory
+- [x] A dedicated **test Entra directory** (not production), its **Directory
       (tenant) ID** (GUID) recorded.
-- [ ] An **app registration** in that directory: supported account type
+- [x] An **app registration** in that directory: supported account type
       "Accounts in this organizational directory only"; platform **Web**;
       redirect URI `https://<staging-host>/idp/callback`.
-- [ ] A **client secret** created for that app (value captured into the secret
-      store, never into chat or the repo).
-- [ ] A **test user** in that directory.
-- [ ] **One out-of-directory identity** (a user from a different directory, or a
-      personal Microsoft account) for the cross-tenant rejection check.
+- [x] A **client secret** created for that app — the secret **Value** (not the
+      Secret ID); captured into the secret store, never into chat or the repo.
+- [x] A **test user** in that directory.
+- [ ] A separate **out-of-directory identity** was **not** used; the cross-tenant
+      gate (§ 2) was instead exercised by pinning an IdP to a *different*
+      directory GUID and attempting login with the in-directory account.
 
-## 2. Entra login + explicit cross-tenant rejection (WS7)
+## 2. Entra login + explicit cross-tenant rejection (WS7 → run under WS9 HTTPS staging)
 
-- [ ] Configure the IdP via the engine API: `provider_type=entra`,
-      `tenant=<directory GUID>`, `client_id`, `client_secret`. Confirm the
-      response `callback_url` equals `{issuer}/idp/callback` and no secret is
-      returned.
-- [ ] Mint the authorization URL and verify host
+- [x] Configure the IdP via the engine API: `provider_type=entra`,
+      `tenant=<directory GUID>`, `client_id`, `client_secret`. Response
+      `callback_url` equalled `{issuer}/idp/callback`; no secret was returned.
+- [x] Mint the authorization URL and verify host
       `login.microsoftonline.com/<guid>/...`, byte-exact
       `redirect_uri=https://<staging-host>/idp/callback`, `state`, `nonce`,
       PKCE `code_challenge`+`S256`, `scope=openid profile email`.
-- [ ] Complete a **human browser login** as the directory test user; verify the
-      redeemed session is `authenticated`, `amr=["fed"]`, `idp_checked`, and the
-      identity is keyed on `(idp_id, subject)` (not email).
-- [ ] **Cross-tenant rejection (mandatory gate):** attempt login with the
-      out-of-directory identity; the engine must **reject** it (issuer `iss`
-      mismatch, strict equality). Record the rejection as evidence.
-- [ ] Live negatives pass: forged `state`, burned intent redeem, wrong
-      `browser_binding`.
+- [x] Complete a **human browser login** as the directory test user; the redeemed
+      session was `authenticated`, `amr=["fed"]`, `idp_checked`, `mfa_required=false`,
+      the identity keyed on `(idp_id, subject)` (not email); redeem HTTP 201.
+- [x] **Cross-tenant rejection (mandatory gate):** an IdP pinned to a *different*
+      directory refused the login; `probe_check` confirmed no usable code reached
+      the engine and **no session was issued**. The refusal occurred at Microsoft's
+      authorize endpoint (single-tenant app), so the engine's strict `iss` equality
+      backstop was **not reached live**; it remains covered by offline unit tests.
+- [x] Live negatives pass: forged `state`→400, burned-intent redeem→401,
+      uncompleted-intent redeem→401. (Isolated wrong `browser_binding` is covered by
+      the offline self-IdP feature test, not as a separate live-provider test.)
 
-> **Status (2026-10-26):** sections 1 and 2 were completed against a *local,
-> non-production* engine (`http://localhost:8080`, `IAM_DEV_MODE=true`) and passed,
-> including the mandatory cross-tenant rejection gate — see ROADMAP.md WS7. The
-> checkboxes above remain unchecked because they are the **HTTPS-staging** form of
-> the same steps (real TLS host, `IAM_DEV_MODE` off), which must still be run under
-> WS9 before they count toward GO.
+> **Status — local non-prod (2026-10-26):** sections 1–2 first passed against a
+> *local* engine (`http://localhost:8080`, `IAM_DEV_MODE=true`) — see ROADMAP.md WS7.
+>
+> **Status — HTTPS staging (2026-10-26):** the boxes above were then completed
+> against the **public HTTPS staging** engine (issuer `https://<staging-host>` served
+> via a Cloudflare Quick Tunnel, `IAM_DEV_MODE` off, dedicated Postgres). Both Google
+> and Entra completed a real human browser login with redeem **HTTP 201**, correct
+> issuer/callback/`state`/`nonce`/PKCE-`S256`, session `amr=["fed"]`+`idp_checked`
+> with no unproven MFA, identity keyed on `(idp_id, subject)`, and the live negatives
+> above. The cross-tenant probe yielded no usable session (caveat above). Each run
+> used a short-lived instance-admin key (the permanent bootstrap key only minted and
+> revoked it), created a throwaway org, and deleted it afterward
+> (`orgs_remaining=0`); with dev mode off the engine required an **https**
+> `return_url`, captured by a loopback HTTPS catcher. No secrets committed. Two Entra
+> input errors were caught and produced **no session** (fail-closed): a Secret **ID**
+> supplied in place of the secret **Value** (`AADSTS7000215`), and a `client_id`/tenant
+> mismatch (`AADSTS700016`); the recorded pass is the corrected run only. Remaining
+> WS9 items (§§ 3–5) — staging-config sign-off, migration/backup-restore and recovery
+> time, external pentest — are still open.
 
 ## 3. Isolated HTTPS staging configuration and secret injection (WS9)
 
