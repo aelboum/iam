@@ -203,6 +203,16 @@ them as documented in "Secret injection" below.
 
 ## 5. External penetration test and evidence retention
 
+> **Status — pentest package prepared, gate OPEN (2026-10-26):** [PENTEST.md](PENTEST.md)
+> now carries explicit scope boundaries (in-scope IAM staging engine/endpoints;
+> out-of-scope production, the co-hosted `vps-ai-pbx` and `zitadel-stack` projects, the
+> shared `cloudflared`/Cloudflare/DNS, and the host OS), reporting format and CVSS
+> severity definitions, retest/acceptance criteria, and an engagement-status note.
+> **No engagement has been initiated** — no provider retained, no charge incurred, no
+> external access granted. An independent qualified tester and explicit operator
+> authorization are required; internal/AI review is **not** a substitute. This gate
+> stays **OPEN**; production remains **NO-GO**.
+
 - [ ] Commission an external pentest using [PENTEST.md](PENTEST.md) as the scope
       brief; test against staging, not production.
 - [ ] Triage findings; remediate Critical/High/Medium; record dispositions in
