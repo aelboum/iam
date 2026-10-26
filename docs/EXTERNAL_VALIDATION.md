@@ -69,41 +69,90 @@ them as documented in "Secret injection" below.
 
 ## 3. Isolated HTTPS staging configuration and secret injection (WS9)
 
-- [ ] Isolated host/cluster at a dedicated DNS name with **TLS 1.2+** terminated
-      by a proxy in front of the engine; no production data/keys/traffic.
-- [ ] Dedicated **Postgres 17** for staging only.
-- [ ] `IAM_ISSUER=https://<staging-host>`; **`IAM_DEV_MODE` unset/false** (the
-      engine must then accept only an https issuer — confirm it refuses http).
-- [ ] `IAM_WEBAUTHN_RP_ID` / `IAM_WEBAUTHN_ORIGINS` set to the login UI's real
-      domain/origin (invalid values fail fast at boot).
-- [ ] Proxy trust: set `IAM_TRUST_PROXY=true` and `IAM_TRUSTED_PROXY_HOPS` to the
-      exact trusted-hop count if the proxy sets client IP.
-- [ ] **Secret injection:** `IAM_MASTER_KEY` (32-byte base64),
-      `IAM_BOOTSTRAP_ADMIN_KEY` (≥32 chars), DB credentials, and per-org IdP
-      client secrets supplied from the platform secret store as environment
-      variables — freshly generated for staging, never reused, never committed,
-      never baked into images.
+- [x] Isolated host/cluster with **TLS 1.2+** terminated by a proxy in front of
+      the engine; no production data/keys/traffic. *(Observed: TLS terminates at
+      the Cloudflare edge; the engine sits behind `cloudflared` with no host port.
+      Deviation: the hostname is an ephemeral Quick-Tunnel name, not a stable
+      dedicated DNS record — acceptable for the rehearsal, must become a stable
+      DNS name for production.)*
+- [x] Dedicated **Postgres 17** for staging only. *(Observed: `postgres:17.2-alpine`,
+      own volume `iam-staging_pgdata`, no published host port, private compose
+      network.)*
+- [x] `IAM_ISSUER=https://<staging-host>`; **`IAM_DEV_MODE=false`** — the engine
+      accepts only an https issuer and refused an `http` `return_url` at runtime
+      (dev mode off confirmed behaviorally). `IAM_ENABLE_DOCS=false` and `/docs`
+      returns 404.
+- [x] `IAM_WEBAUTHN_RP_ID` / `IAM_WEBAUTHN_ORIGINS` set to the staging host and
+      logged at boot; invalid values fail fast at boot.
+- [x] Proxy trust: `IAM_TRUST_PROXY=true`, `IAM_TRUSTED_PROXY_HOPS=1` (one proxy,
+      `cloudflared`, in front). `IAM_SHARED_RATE_LIMITS=true` (PG-backed shared
+      limiter).
+- [x] **Secret injection:** `IAM_MASTER_KEY`, `IAM_BOOTSTRAP_ADMIN_KEY`, DB
+      credentials, and per-org IdP client secrets are supplied as environment
+      variables, freshly generated for staging, never committed, never baked into
+      images (client secrets are sealed AES-GCM at rest, never returned). *(Deviation:
+      they come from a gitignored `.env.staging` file on the host, not a managed
+      secret store; the DB URL uses `sslmode=disable` over the private compose
+      network — both acceptable for staging, to be hardened for production.)*
 - [ ] Rotate the bootstrap admin key to a managed instance-admin key after boot.
+      *(Not done on staging: the bootstrap key is still active. Short-lived
+      instance-admin keys were minted and revoked for the live tests, but the
+      boot bootstrap key has not been rotated away.)*
+
+> **Status — staging configuration sign-off (2026-10-26, B1):** the running stack
+> was audited read-only. Container hardening observed on the engine: read-only root
+> filesystem, `cap_drop=[ALL]`, `no-new-privileges`, non-root user `65532`, no
+> published ports, `restart=unless-stopped`, single private network; images pinned
+> (`postgres:17.2-alpine`, `cloudflare/cloudflared:2026.9.3`, engine built locally);
+> `cloudflared` equally hardened and outbound-only. No host listener on 8080/5432/80/443.
+> Issuer, callback (`{issuer}/idp/callback`), WebAuthn RP ID and origins are mutually
+> consistent. Logging does not leak secrets (a provider `AADSTS7000215` error logged on
+> a failed exchange contains the public app id and Microsoft trace ids only — no client
+> secret). **Result: PASS with noted deviations** (ephemeral Quick-Tunnel hostname vs
+> dedicated DNS; `.env.staging` file vs managed secret store; DB `sslmode=disable` on the
+> private network; bootstrap-admin not yet rotated). These are staging-acceptable and are
+> recorded as production follow-ups; none is a material unknown. Production remains NO-GO.
 
 ## 4. Migrations, backup/restore, recovery time, rollback (WS9 / WS4)
 
 - [x] Run [`scripts/migration_rehearsal.sh`](../scripts/migration_rehearsal.sh)
       against the staging engine image; retain its `ALL_PASS` log (fresh install,
       backup/restore to an isolated target, pre-0007 upgrade path).
-- [ ] Confirm on the live staging DB: `schema_migrations` lists every migration;
-      health check passes; a real login flow succeeds; audit events are written.
-      *(Partly done: live `schema_migrations=7` and `/healthz` pass confirmed, and
-      real Google/Entra logins succeeded under HTTPS staging — §§ 1–2 / ROADMAP
-      WS5/WS7; writing of audit events was not separately verified in this run.)*
+- [x] Confirm on the live staging DB: `schema_migrations` lists every migration
+      (live count = 7); health check passes (`/healthz` 200); a real login flow
+      succeeds (live Google/Entra — §§ 1–2 / ROADMAP WS5/WS7); audit events are
+      written and persisted (verified via the authorized audit API, B3 below).
+
+> **Status — live audit-event persistence (2026-10-26, B3):** verified against the
+> staging engine with a short-lived instance-admin key and disposable orgs (deleted
+> afterward; `orgs_remaining=0`). A known auditable operation (`api_key.created` in a
+> throwaway org) produced a record that was read back through the authorized audit
+> interface (`GET /v1/orgs/{orgID}/audit`) — proving persistence, not mere emission —
+> with correct `action`, `org_id`, `actor` (`api_key:<id>`), `target`, and `at`
+> timestamp (`audit_events` schema: `0002_hardening.sql`). **No secret leakage:** the
+> created key's value is absent from the audit payload and no `iam_` token string
+> appears; `detail` carries only `{name, scope}`. **Tenant isolation:** an
+> organization-scoped admin key for org B reading org A's audit returned **403**, while
+> reading its own org returned **200**. **Failure behavior:** `store.Audit`
+> (`internal/store/audit.go:22-35`) logs a failed insert at ERROR and does **not** fail
+> the audited operation — a deliberate availability-over-strict-audit choice, observable
+> via the ERROR log for alerting (recorded as an accepted design note). Existing
+> automated coverage asserts audit behavior in the smoke suite (IP taken from the
+> connection not a header; expected action set; failed-login events).
 - [x] **Real backup tooling** (not just the rehearsal script): take a backup with
       the environment's actual tooling, restore it onto an **isolated target
       first**, validate schema + data there before any reuse.
 - [x] **Measure and record recovery time** (backup → validated restore) so an
       incident has a known bound.
-- [ ] **Rollback criteria rehearsed** (STAGING.md § *Rollback and recovery
-      criteria*): abort conditions defined; understand that a binary rollback
-      does **not** undo committed schema (0006/0007); schema + binary recovery
-      decided together.
+- [x] **Rollback criteria rehearsed** (STAGING.md § *Rollback and recovery
+      criteria*): abort conditions and rollback triggers defined, decision
+      ownership and preconditions documented, per-migration forward-only strategy
+      stated (restore-from-backup, no invented down-migrations). **Rehearsed
+      2026-10-26 (disposable):** seeded DB (7 migrations, 3 orgs) → backup →
+      simulated degradation (`DROP TABLE orgs CASCADE` on the disposable source
+      only) → restore to a fresh isolated target → 7 migrations and 3 orgs
+      recovered, fresh engine reachable with zero further migrations, pre/post
+      integrity matched. The active staging DB was never touched.
 
 > **Status — staging recovery rehearsal (2026-10-26):** executed against the running
 > HTTPS staging stack.
@@ -139,6 +188,18 @@ them as documented in "Secret injection" below.
 > **Still open (unchecked above):** live-DB audit-event write verification, and the
 > **rollback-criteria rehearsal**; see also § 3 (staging-config sign-off) and § 5
 > (external pentest). Production remains **NO-GO**.
+
+> **Status — recovery-time at a larger synthetic volume (2026-10-26, B4):** repeated
+> on disposable containers with a seeded **71 MB** database — 1,000 orgs, 10,000 users,
+> 500,000 audit rows (synthetic, no real user data). Phased, with robust readiness
+> checks and `ON_ERROR_STOP=1` (no `|| true`): backup **1.11 s** (44.4 MB dump); fresh
+> target provisioning **2.72 s**; restore **2.87 s**; application readiness **1.54 s**
+> (a fresh engine reachable, zero further migrations); **total recovery 8.73 s**.
+> Integrity: all row counts matched the source exactly (orgs 1000, users 10000, audit
+> 500000) and `schema_migrations=7`. **Bounded estimate, not a production SLA:** the
+> volume is a defensible synthetic baseline for the rehearsal (no documented production
+> capacity target exists); larger datasets, slower storage, or a network restore path
+> would increase the time. No recovery-time objective (RTO) is claimed.
 
 ## 5. External penetration test and evidence retention
 

@@ -96,6 +96,34 @@ Decide and prove these in staging, not during a production incident:
 - **Rehearse the restore** with the environment's real backup tooling (step 6),
   and record the measured restore time so an incident has a known bound.
 
+**Rollback triggers (stop the rollout and execute recovery).** Any of: a migration
+fails or aborts mid-apply; the engine is unhealthy after an upgrade (health check
+fails, or it will not start); a database integrity check fails; identity/federation
+flows are unavailable (login or redeem broken for a supported provider); key or
+session incompatibility appears after a key or schema change; a backup or restore
+fails its validation; or recovery is trending past the agreed time bound.
+
+**Decision ownership and preconditions.** The release manager decides a rollback,
+with the platform/DBA owner for any database action. Preconditions: a validated,
+recent backup retained off-host, and a known-good previous engine image. Recovery
+action: restore the validated backup to an isolated target, validate schema and data
+there, then cut over — and pair the binary and schema recovery decision, because an
+older binary may not understand newer schema.
+
+**Per-migration strategy (forward-only).** Migrations 0001–0007 are forward-only and
+each is transactional (atomic per file). There are no down-migrations and none should
+be invented: reversing committed schema (e.g. 0006/0007) can lose data. The rollback
+path is therefore restore-from-backup plus a compatible engine image, not a schema
+down-migration.
+
+**Rehearsed (2026-10-26, disposable).** On throwaway containers: a seeded database
+(7 migrations, 3 orgs) was backed up, then degraded (`DROP TABLE orgs CASCADE` on the
+disposable source only — never the active staging DB), then recovered by restoring the
+backup onto a fresh isolated target: 7 migrations and all 3 orgs restored, a fresh engine
+became reachable and applied zero further migrations, and the pre/post integrity check
+matched (`pre_orgs == post_orgs`). Evidence is recorded in
+[EXTERNAL_VALIDATION.md](EXTERNAL_VALIDATION.md) § 4.
+
 ## Ephemeral VM runbook (the committed staging bundle)
 
 The reviewable bundle is `docker-compose.staging.yml` (project name
