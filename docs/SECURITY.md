@@ -40,7 +40,7 @@ does **not** substitute for the live-provider and staging validation tracked in
 | Encryption & key rotation | Plaintext at rest, rotation data loss | Secrets sealed (AES-GCM); previous-key decryption during rotation (`internal/config/config.go`, M6); batched CAS re-encrypt; `rotate-keys --check` strictly read-only (`cmd/iamd/main.go:263-301`, M9). |
 | DB failure & concurrency | Race double-spend, fail-open | Per-factor lockout bounded under parallel guesses (`users.go:179`); counter CAS (L9); limiter fallback (M10). |
 | Audit & sensitive data | Secret leakage, missing trail | Client secrets encrypted, never returned/logged; audit records issuer/provider_type/trust changes, logins, lockouts (`orgs.go` audit calls, `authn.go:702`). |
-| Tenant isolation | Cross-tenant token acceptance (Entra) | Issuer pinned to tenant GUID (`internal/authn/providers.go:91-95`); other tenants' tokens differ in `iss` and are rejected by strict equality. |
+| Tenant isolation | Cross-tenant token acceptance (Entra) | Issuer pinned to tenant GUID (`internal/authn/providers.go:91-95`); other tenants' tokens differ in `iss` and are rejected by strict equality. Verified live 2026-10-26 (local non-prod, WS7): an IdP pinned to a different directory refused an out-of-directory identity and issued no session. |
 | Migration & recovery | Partial upgrade, data loss | Forward-only, per-migration transactional incl. version record (`internal/db/db.go:52-91`); upgrade/recovery documented (`DEPLOYMENT.md`). |
 
 ## Remediated audit findings

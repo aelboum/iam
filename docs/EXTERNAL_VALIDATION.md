@@ -44,6 +44,13 @@ them as documented in "Secret injection" below.
 - [ ] Live negatives pass: forged `state`, burned intent redeem, wrong
       `browser_binding`.
 
+> **Status (2026-10-26):** sections 1 and 2 were completed against a *local,
+> non-production* engine (`http://localhost:8080`, `IAM_DEV_MODE=true`) and passed,
+> including the mandatory cross-tenant rejection gate — see ROADMAP.md WS7. The
+> checkboxes above remain unchecked because they are the **HTTPS-staging** form of
+> the same steps (real TLS host, `IAM_DEV_MODE` off), which must still be run under
+> WS9 before they count toward GO.
+
 ## 3. Isolated HTTPS staging configuration and secret injection (WS9)
 
 - [ ] Isolated host/cluster at a dedicated DNS name with **TLS 1.2+** terminated
