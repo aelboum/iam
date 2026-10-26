@@ -494,15 +494,23 @@ def main():
     # block a phishing-resistant passkey the attacker cannot guess. Before the
     # fix the passkey/federated/finalize paths used IsLocked() (which includes
     # the temporary lockout), so password guessing denied all factors.
-    api(key, "PUT", f"/users/{pia['id']}/password", {"password": "correct-horse-xfactor-1"})
+    # A fresh user, so the per-account attempt limiter (keyed on org:login_name,
+    # capacity 10) is not already consumed by the earlier passkey operations.
+    xname = f"xfactor-{sfx}"
+    xuser = api(key, "POST", f"/orgs/{acme['id']}/users",
+                {"username": xname, "email": f"{xname}@acme.test", "password": "correct-horse-xfactor-1"})
+    xauth = Authenticator()
+    xopts = api(key, "POST", f"/users/{xuser['id']}/passkeys/registration")
+    api(key, "POST", f"/users/{xuser['id']}/passkeys/registration/finish",
+        {"name": "xfactor key", "credential": xauth.register(xopts)})
     for _ in range(5):  # a fresh session per guess, like the smoke lockout test
-        t.password_step(login_key, acme["slug"], "pia", "definitely-wrong")
-    _, pstatus, _ = t.password_step(login_key, acme["slug"], "pia", "correct-horse-xfactor-1")
+        t.password_step(login_key, acme["slug"], xname, "definitely-wrong")
+    _, pstatus, _ = t.password_step(login_key, acme["slug"], xname, "correct-horse-xfactor-1")
     check(pstatus == 401, "the password factor is locked after repeated failures")
-    xs = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": "pia"})
+    xs = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": xname})
     xo = api(login_key, "POST", f"/sessions/{xs['session_id']}/passkey/begin", {"session_token": xs["session_token"]})
     xst = api(login_key, "POST", f"/sessions/{xs['session_id']}/passkey/finish",
-              {"session_token": xs["session_token"], "credential": synced.assert_(xo)})
+              {"session_token": xs["session_token"], "credential": xauth.assert_(xo)})
     check(xst.get("authenticated") is True,
           "a passkey login still succeeds during a temporary password lockout (cross-factor DoS fix)")
 
