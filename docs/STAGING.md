@@ -334,7 +334,9 @@ tunnel (never a public port), a client cannot inject `X-Forwarded-For` directly.
 3. Supply the token at deploy time only:
    `export CLOUDFLARE_TUNNEL_TOKEN=…` (or a gitignored secret file passed with a
    second `--env-file`). Never commit or print it; never reuse another tunnel's
-   token.
+   token. **Do not run a bare `docker compose … config`** while the token is set
+   — it prints the resolved token in its output; validate with `config -q`
+   (quiet) or with the token unset. cloudflared itself does not log the token.
 
 ### Provider redirect URIs
 
@@ -358,9 +360,25 @@ docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.ym
 - **Rollback:** `docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml stop cloudflared`
   stops ingress immediately; disable or delete the public hostname in the
   Cloudflare dashboard to stop serving.
-- **Teardown:** preserve the backup off the VM first, then
-  `docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml --env-file .env.staging down -v`
-  removes only the `iam-staging` containers (incl. this cloudflared), its
+- **Teardown:** preserve the backup off the VM first. Then **verify exactly what
+  will be removed belongs to `iam-staging`** before deleting anything — if any
+  line below shows a `vps-ai-pbx`, `zitadel-stack`, or otherwise unexpected
+  object, **stop and investigate** rather than proceeding:
+
+  ```
+  # Containers, volumes, and networks scoped to this project only:
+  docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml ps -a
+  docker volume ls  --filter label=com.docker.compose.project=iam-staging
+  docker network ls --filter label=com.docker.compose.project=iam-staging
+  ```
+
+  Only once every listed object is `iam-staging`:
+
+  ```
+  docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml --env-file .env.staging down -v
+  ```
+
+  This removes only the `iam-staging` containers (incl. this cloudflared), its
   network, and its volumes. Then **delete the new tunnel** in the Cloudflare
   dashboard. The existing `vps-ai-pbx` tunnel and both existing stacks are never
   touched.

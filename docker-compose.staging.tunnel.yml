@@ -30,8 +30,10 @@ services:
   # docs/STAGING.md "Option B" for the empirical hop verification.
 
   cloudflared:
-    # Pin a specific, known-good release (verify it is current before deploy).
-    image: cloudflare/cloudflared:2024.10.1
+    # Deliberately pinned to a matured release that is past the 2026.8.0/8.1
+    # HTTP-origin path-normalization bugs (our origin is http://iam:8080) and is
+    # not bleeding-edge. Re-check for a newer stable before deploy.
+    image: cloudflare/cloudflared:2026.9.3
     restart: unless-stopped
     # Token-based (remotely managed) tunnel: the public-hostname -> service
     # ingress is configured in the Cloudflare dashboard (service = http://iam:8080).
