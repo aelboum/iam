@@ -464,26 +464,26 @@ func (t *guardedTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 var nonPublicPrefixes = func() []netip.Prefix {
 	var out []netip.Prefix
 	for _, p := range []string{
-		"0.0.0.0/8",       // "this network"
-		"100.64.0.0/10",   // carrier-grade NAT; includes Alibaba Cloud metadata 100.100.100.200
-		"192.0.0.0/24",    // IETF protocol assignments
-		"192.0.2.0/24",    // documentation
-		"198.18.0.0/15",   // benchmarking
-		"198.51.100.0/24", // documentation
-		"203.0.113.0/24",  // documentation
-		"240.0.0.0/4",     // reserved, includes broadcast
-		"192.88.99.0/24",  // 6to4 relay anycast (deprecated, special-use)
+		"0.0.0.0/8",        // "this network"
+		"100.64.0.0/10",    // carrier-grade NAT; includes Alibaba Cloud metadata 100.100.100.200
+		"192.0.0.0/24",     // IETF protocol assignments
+		"192.0.2.0/24",     // documentation
+		"198.18.0.0/15",    // benchmarking
+		"198.51.100.0/24",  // documentation
+		"203.0.113.0/24",   // documentation
+		"240.0.0.0/4",      // reserved, includes broadcast
+		"192.88.99.0/24",   // 6to4 relay anycast (deprecated, special-use)
 		"168.63.129.16/32", // Azure wireserver/metadata (routable but infra-only)
-		"64:ff9b::/96",    // NAT64 (embeds an IPv4 address)
-		"64:ff9b:1::/48",  // local NAT64
-		"100::/64",        // discard
-		"2001::/32",       // Teredo (embeds an IPv4 address)
-		"2001:db8::/32",   // documentation
-		"2002::/16",       // 6to4 (embeds an IPv4 address)
-		"fc00::/7",        // unique local
-		"::/96",           // IPv4-compatible IPv6 (embeds an IPv4 address)
-		"fec0::/10",       // deprecated site-local
-		"3fff::/20",       // documentation (RFC 9637)
+		"64:ff9b::/96",     // NAT64 (embeds an IPv4 address)
+		"64:ff9b:1::/48",   // local NAT64
+		"100::/64",         // discard
+		"2001::/32",        // Teredo (embeds an IPv4 address)
+		"2001:db8::/32",    // documentation
+		"2002::/16",        // 6to4 (embeds an IPv4 address)
+		"fc00::/7",         // unique local
+		"::/96",            // IPv4-compatible IPv6 (embeds an IPv4 address)
+		"fec0::/10",        // deprecated site-local
+		"3fff::/20",        // documentation (RFC 9637)
 	} {
 		out = append(out, netip.MustParsePrefix(p))
 	}
