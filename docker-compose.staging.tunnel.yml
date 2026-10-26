@@ -1,0 +1,50 @@
+# Option B override: a DEDICATED Cloudflare Tunnel for IAM staging.
+#
+# Use it ON TOP OF the base bundle. Caddy and host ports 80/443 are NOT started
+# in this mode; TLS terminates at the Cloudflare edge and a dedicated cloudflared
+# makes only OUTBOUND 443 connections to Cloudflare, forwarding requests to the
+# engine over the private compose network (http://iam:8080). Postgres and the
+# engine stay private — no host port is published.
+#
+#   docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml \
+#     --env-file .env.staging up -d --build
+#
+# This tunnel is SEPARATE from the host's existing vps-ai-pbx cloudflared: its
+# own container, its own token (CLOUDFLARE_TUNNEL_TOKEN, injected at deploy time
+# and never committed). The existing tunnel is never read, edited, or restarted.
+#
+# Same project name as the base so volumes/teardown stay unified.
+name: iam-staging
+
+services:
+  # In tunnel mode Caddy is not used. Placing it behind a profile means a plain
+  # `up` with this override does NOT start it (and therefore binds no host port),
+  # while the base file itself is left completely unchanged. To run the Option A
+  # host-port stack instead, use the base file WITHOUT this override.
+  caddy:
+    profiles: ["hostport-only"]
+
+  # The engine is unchanged from the base (expose: ["8080"], no published ports).
+  # It already sets IAM_TRUST_PROXY=true and IAM_TRUSTED_PROXY_HOPS=1; with
+  # cloudflared as the single proxy in front, 1 is the expected hop count. See
+  # docs/STAGING.md "Option B" for the empirical hop verification.
+
+  cloudflared:
+    # Pin a specific, known-good release (verify it is current before deploy).
+    image: cloudflare/cloudflared:2024.10.1
+    restart: unless-stopped
+    # Token-based (remotely managed) tunnel: the public-hostname -> service
+    # ingress is configured in the Cloudflare dashboard (service = http://iam:8080).
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # Injected at deploy time from the host secret store or shell; it is never
+      # written to the committed example env and never printed.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN}
+    # Outbound-only; no inbound ports. Hardened like the rest of the stack.
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      iam:
+        condition: service_healthy

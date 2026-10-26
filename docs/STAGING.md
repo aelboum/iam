@@ -270,6 +270,101 @@ but for a disposable run prefer tear-down + rebuild). Let's Encrypt and the
 provider hostname are free; the only running cost is VM compute, which is
 sub-dollar for a few hours. Delete the VM as soon as evidence is captured.
 
+## Option B — dedicated Cloudflare Tunnel (alternative to host-port Caddy)
+
+Use this variant to host staging next to an existing deployment that already
+fronts traffic with its own tunnel, without opening host ports 80/443. It is a
+separate override; the base bundle (Option A, Caddy on 80/443) is unchanged and
+still usable on its own.
+
+### Where TLS terminates and how a request reaches IAM
+
+```
+visitor ──HTTPS──▶ Cloudflare edge (TLS terminates here) ──tunnel──▶
+  cloudflared (in the iam-staging network, OUTBOUND 443 only) ──http──▶ iam:8080
+```
+
+The engine is never bound to a host port; Postgres stays private. `cloudflared`
+opens only outbound connections, so no inbound firewall change and no host
+80/443 are needed (this is why it coexists with an existing tunnel-fronted app).
+
+Start it with both files (Caddy and host ports are not started):
+
+```
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml \
+  --env-file .env.staging up -d --build
+```
+
+### Keep the public URL consistent
+
+Set `IAM_DOMAIN` in `.env.staging` to the **Cloudflare public hostname** (e.g.
+`iam-staging.example.com`). Everything derives from it and must match exactly:
+`IAM_ISSUER=https://<IAM_DOMAIN>`, the OIDC discovery `issuer`, the redirect URI
+`https://<IAM_DOMAIN>/idp/callback`, and `IAM_WEBAUTHN_ORIGINS=https://<IAM_DOMAIN>`.
+Dev mode stays off; the engine accepts the https issuer string even though TLS is
+terminated upstream at Cloudflare.
+
+### Trusted-proxy handling (review)
+
+The engine derives the client IP as the entry `IAM_TRUSTED_PROXY_HOPS` from the
+**right** of `X-Forwarded-For`; entries to the left (client-supplied) are ignored
+and `X-Real-IP` is never trusted (`cmd/iamd/main.go:194-214`). With cloudflared as
+the single proxy in front, the expected value is `IAM_TRUSTED_PROXY_HOPS=1` (as
+set in the base compose). Because the engine is reachable **only** through the
+tunnel (never a public port), a client cannot inject `X-Forwarded-For` directly.
+
+- **No code change is required.** The only tunable is the hop count.
+- **Verify the hop count empirically** after bring-up: make a request from a
+  known client IP and confirm it is attributed to that IP (e.g. in a rate-limit
+  or audit observation). If the observed address is a Cloudflare address instead
+  of the real client, set `IAM_TRUSTED_PROXY_HOPS=2` and recheck.
+- **Confirm `X-Forwarded-Proto: https` reaches the engine** (Cloudflare sets it
+  by default). The engine treats a request as secure when `r.TLS != nil` **or**
+  `X-Forwarded-Proto == "https"` (`cmd/iamd/main.go:345`); this header is what
+  makes that true behind the tunnel.
+
+### Manual Cloudflare configuration (operator)
+
+1. Create a **new, dedicated** tunnel in the Cloudflare Zero Trust dashboard
+   (do **not** reuse the existing `vps-ai-pbx` tunnel). Copy its **token**.
+2. Add a **public hostname** on that tunnel, e.g. `iam-staging.example.com`,
+   routed to service **`http://iam:8080`** (cloudflared resolves `iam` on the
+   staging network). Cloudflare manages the hostname's DNS automatically — no
+   manual DNS record, no firewall/port change.
+3. Supply the token at deploy time only:
+   `export CLOUDFLARE_TUNNEL_TOKEN=…` (or a gitignored secret file passed with a
+   second `--env-file`). Never commit or print it; never reuse another tunnel's
+   token.
+
+### Provider redirect URIs
+
+Add `https://<IAM_DOMAIN>/idp/callback` (the Cloudflare hostname) as a redirect
+URI on the **Google** OAuth client and the **Entra** app registration (Web
+platform), alongside the existing ones.
+
+### Health checks (tunnel mode)
+
+Run the issuer/dev-mode checks from the base runbook, plus — over the public
+Cloudflare URL rather than a host port:
+
+```
+curl -fsS https://<IAM_DOMAIN>/healthz && echo "  healthz OK (via tunnel)"
+# live issuer check (same python snippet as above) against https://<IAM_DOMAIN>
+docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml ps
+```
+
+### Rollback and teardown (tunnel scope only)
+
+- **Rollback:** `docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml stop cloudflared`
+  stops ingress immediately; disable or delete the public hostname in the
+  Cloudflare dashboard to stop serving.
+- **Teardown:** preserve the backup off the VM first, then
+  `docker compose -f docker-compose.staging.yml -f docker-compose.staging.tunnel.yml --env-file .env.staging down -v`
+  removes only the `iam-staging` containers (incl. this cloudflared), its
+  network, and its volumes. Then **delete the new tunnel** in the Cloudflare
+  dashboard. The existing `vps-ai-pbx` tunnel and both existing stacks are never
+  touched.
+
 ## Go / no-go
 
 Staging is complete for pre-production only when steps 1–4 pass with retained
