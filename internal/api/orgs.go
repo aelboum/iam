@@ -133,6 +133,12 @@ func (s *Server) issueAPIKey(w http.ResponseWriter, r *http.Request, orgID *stri
 		t := time.Now().Add(time.Duration(body.ExpiresInDays) * 24 * time.Hour)
 		expires = &t
 	}
+	// A key may not mint a successor that outlives it. Otherwise a leaked but
+	// still-valid key could renew itself indefinitely, defeating the expiry cap.
+	// Keys with no expiry (instance/bootstrap) are not capped.
+	if parent := caller.key.ExpiresAt; parent != nil && (expires == nil || expires.After(*parent)) {
+		expires = parent
+	}
 	raw := "iam_" + secret.Token(32)
 	key, err := s.store.CreateAPIKey(r.Context(), body.Name, orgID, body.Scope, expires, secret.Hash(raw), &caller.key.ID)
 	if err != nil {

@@ -668,7 +668,10 @@ func (s *Service) FinalizeAuthRequest(ctx context.Context, c Client, authRequest
 	if user == nil {
 		return ErrNotAuthenticated
 	}
-	if user.IsLocked() {
+	// Manual lock only, consistent with the OP storage check: a temporary
+	// failed-guess lockout must not block finalizing an already-authenticated
+	// session (the first factor already succeeded under its own lockout).
+	if user.Locked {
 		return ErrLocked
 	}
 	state := s.state(sess, user)

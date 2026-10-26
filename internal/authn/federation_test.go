@@ -44,6 +44,7 @@ func TestPublicAddress(t *testing.T) {
 		"::1", "::", "fe80::1", "fc00::1", "fd12:3456::1", "::ffff:127.0.0.1", "::ffff:10.0.0.1",
 		"::ffff:169.254.169.254", "64:ff9b::a9fe:a9fe", "64:ff9b:1::1", "2002:7f00:1::", "2001:0:4136::1",
 		"2001:db8::1", "ff02::1",
+		"192.88.99.1", "168.63.129.16", "::5", "fec0::1", "3fff::1",
 	}
 	for _, s := range blocked {
 		if PublicAddress(netip.MustParseAddr(s)) {

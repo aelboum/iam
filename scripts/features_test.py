@@ -490,6 +490,35 @@ def main():
              {"session_token": s["session_token"], "credential": synced.assert_(o)})
     check(st["authenticated"] and st["amr"] == ["swk", "user", "mfa"], f"synced passkey reported as swk ({st.get('amr')})")
 
+    # Regression (cross-factor lockout): a temporary password lockout must NOT
+    # block a phishing-resistant passkey the attacker cannot guess. Before the
+    # fix the passkey/federated/finalize paths used IsLocked() (which includes
+    # the temporary lockout), so password guessing denied all factors.
+    api(key, "PUT", f"/users/{pia['id']}/password", {"password": "correct-horse-xfactor-1"})
+    lock_sess = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": "pia"})
+    for _ in range(5):
+        http("POST", f"/v1/sessions/{lock_sess['session_id']}/password",
+             {"session_token": lock_sess["session_token"], "password": "definitely-wrong"},
+             {"Authorization": "Bearer " + login_key})
+    ps = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": "pia"})
+    pstatus, _, _ = http("POST", f"/v1/sessions/{ps['session_id']}/password",
+                         {"session_token": ps["session_token"], "password": "correct-horse-xfactor-1"},
+                         {"Authorization": "Bearer " + login_key})
+    check(pstatus == 401, "the password factor is locked after repeated failures")
+    xs = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": "pia"})
+    xo = api(login_key, "POST", f"/sessions/{xs['session_id']}/passkey/begin", {"session_token": xs["session_token"]})
+    xst = api(login_key, "POST", f"/sessions/{xs['session_id']}/passkey/finish",
+              {"session_token": xs["session_token"], "credential": synced.assert_(xo)})
+    check(xst.get("authenticated") is True,
+          "a passkey login still succeeds during a temporary password lockout (cross-factor DoS fix)")
+
+    # Regression (API-key expiry cap): a key may not mint a successor that
+    # outlives it, or a leaked but still-valid key could renew itself forever.
+    shortkey = api(key, "POST", f"/orgs/{acme['id']}/api-keys", {"name": "short-parent", "scope": "admin", "expires_in_days": 1})
+    child = api(shortkey["key"], "POST", f"/orgs/{acme['id']}/api-keys", {"name": "child", "scope": "admin", "expires_in_days": 365})
+    check(bool(child.get("expires_at")) and child["expires_at"] <= shortkey["expires_at"],
+          "a child key cannot be minted to outlive its parent (expiry cap)")
+
     print("ALL FEATURE CHECKS PASSED")
 
 

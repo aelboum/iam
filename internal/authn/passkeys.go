@@ -167,7 +167,10 @@ func (s *Service) FinishPasskeyLogin(ctx context.Context, c Client, id, token st
 	if !s.accountLimit.Allow(attemptKey(sess)) {
 		return nil, ErrRateLimited
 	}
-	if sess.WebAuthnSession == nil || user == nil || user.IsLocked() {
+	// Manual lock only: a temporary lockout from failed password/TOTP guesses
+	// must not deny a phishing-resistant passkey the attacker cannot guess
+	// (otherwise guessing is a denial of service; mirrors the OP storage rule).
+	if sess.WebAuthnSession == nil || user == nil || user.Locked {
 		return nil, ErrInvalidCredentials
 	}
 	// The challenge is single use, whatever the outcome.

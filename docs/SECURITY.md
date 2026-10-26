@@ -60,6 +60,36 @@ unique-violation echoes the conflicting value (e.g. a user's email) into logs.
 The refusal now logs a coarse reason (`locked` / `no_account`) and, for an
 unexpected error, only its Go type — no user data (`authn/federation.go`).
 
+A third independent adversarial review (2026-10-26) found **no new Critical,
+High or Medium** defect. Three items were fixed and three dispositioned:
+
+- **Fixed — cross-factor lockout (Low, availability).** A temporary lockout from
+  failed password/TOTP guesses had blocked passkey login, federated (SSO) login,
+  and auth-request finalize, because those paths used `IsLocked()` (manual lock
+  **or** active temporary lockout). An attacker who knew a username could then
+  deny all factors — including a phishing-resistant passkey — by guessing
+  passwords ~5 times per lockout window, renewably. These paths now check the
+  **manual** `Locked` flag only, matching the deliberate OP-storage rule
+  (`oidcop/storage.go`); the password/TOTP steps still enforce their own lockout
+  (`authn.go` `CheckPassword`/`CheckTOTP`). Regression: `features_test.py`
+  (passkey succeeds during a password lockout). Files: `authn/passkeys.go`,
+  `authn/federation.go`, `authn/authn.go`.
+- **Fixed — SSRF denylist gaps (Informational, hardening).** `PublicAddress` now
+  also blocks `168.63.129.16/32` (Azure wireserver), `192.88.99.0/24` (6to4
+  relay anycast), `::/96` (IPv4-compatible), `fec0::/10` (site-local) and
+  `3fff::/20` (documentation). Regression: `TestPublicAddress`
+  (`authn/federation_test.go`). None was shown exploitable (https-only outside
+  dev, Linux does not route `::/96`); added as defense-in-depth.
+- **Fixed — API-key self-renewal (Low).** A leaked but still-valid key could mint
+  a successor that outlived it, indefinitely. `issueAPIKey` now caps a child's
+  expiry at the parent key's expiry (`api/orgs.go`); keys with no expiry
+  (instance/bootstrap) are unaffected. Regression: `features_test.py`
+  (child cannot outlive parent).
+- **Dispositioned** (see register rows N7–N10 below): federated step-up is not
+  forwarded to the IdP; the TOTP failure counter is intentionally sticky;
+  `SafeIdPURL` is not re-run in `HandleCallback` (the dial guard and https-only
+  transport still hold); and rate limits key on the full IPv6 address, not a /64.
+
 ## Residual-risk register
 
 | ID | Risk | Severity | Impact | Compensating control | Disposition / owner |
@@ -71,6 +101,10 @@ unexpected error, only its Go type — no user data (`authn/federation.go`).
 | N4 | Entra accepts the MSA consumers GUID as a tenant | Informational | None — resolves to the real MSA directory (same as the `microsoft` preset) | Tenant-GUID validation; documented | **Accepted.** Owner: maintainer. |
 | N5 | Preset scopes are caller-supplied | Informational | None — upstream provider rejects unsupported scopes | `validList` validation | **Accepted.** Owner: maintainer. |
 | N6 | Generic-OIDC issuer has its trailing `/` trimmed (`api/orgs.go:268`) | Low (functional) | A provider whose canonical issuer ends in `/` (e.g. Auth0) fails `iss` strict-equality and login is refused — fails closed, no security impact; presets are unaffected (issuer pinned server-side) | Strict issuer equality is intentional; failure is closed, not a bypass | **Open — needs a live generic-OIDC provider that uses a trailing-slash issuer to verify any fix; not changed blind because it touches issuer equality.** Owner: maintainer. |
+| N7 | Federated step-up is not enforced at the IdP: `prompt=login` / `max_age` are not forwarded, and `auth_time` is stamped from the engine's `IDPCheckedAt` | Low | A relying party's step-up demand can be satisfied by an existing IdP session with no fresh IdP interaction | Documented in PENTEST.md; a relying party needing hard step-up should require a local factor after SSO | **Accepted (documented).** Owner: maintainer. |
+| N8 | TOTP failure counter (`mfa_failed_logins`) does not decay and is not cleared by a password success | Low | After a few bad TOTP guesses a later legitimate typo can trigger a 15-minute lockout | The sticky counter is an intentional TOTP brute-force bound; clearing it on password success would let a password holder reset the TOTP guess budget | **Accepted (intended).** Owner: maintainer. |
+| N9 | `SafeIdPURL` is not re-checked in `HandleCallback` (endpoints are re-read from discovery) | Informational | A generic-OIDC org admin could aim a blind token-endpoint POST at any public https URL | The dial guard (`PublicAddress`), https-only transport, and body caps hold on every hop and redirect | **Accepted.** Owner: maintainer. |
+| N10 | Rate limits key on the full IPv6 address, not a /64 | Low | A /64 holder can rotate addresses to evade IP-based limits | Per-account lockout and 256-bit secrets hold; `X-End-User-IP` is trusted only from login-API keys; `/idp/callback` needs a valid state | **Accepted (known).** Owner: maintainer. |
 
 Review this register whenever dependencies, migrations, or the trust model change.
 

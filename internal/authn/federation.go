@@ -225,7 +225,11 @@ func (s *Service) resolveFederatedUser(ctx context.Context, idp *store.IDP, clai
 		if user.OrgID != idp.OrgID {
 			return nil, ErrNoAccount
 		}
-		if user.IsLocked() {
+		// Only a manual admin lock blocks a federated login. A temporary lockout
+		// from failed password/TOTP guesses must not deny an external SSO (or a
+		// passkey) the attacker cannot guess, or guessing becomes a denial of
+		// service against phishing-resistant factors (mirrors the OP storage rule).
+		if user.Locked {
 			return nil, ErrLocked
 		}
 		return user, nil
@@ -299,7 +303,9 @@ func (s *Service) RedeemFederatedLogin(ctx context.Context, c Client, intentID, 
 	if c.OrgID != "" && c.OrgID != user.OrgID {
 		return nil, ErrInvalidCredentials
 	}
-	if user.IsLocked() {
+	// Manual lock only (see resolveFederatedUser): a temporary failed-guess
+	// lockout must not deny this SSO redeem.
+	if user.Locked {
 		return nil, ErrLocked
 	}
 	token := secret.Token(32)
@@ -466,6 +472,8 @@ var nonPublicPrefixes = func() []netip.Prefix {
 		"198.51.100.0/24", // documentation
 		"203.0.113.0/24",  // documentation
 		"240.0.0.0/4",     // reserved, includes broadcast
+		"192.88.99.0/24",  // 6to4 relay anycast (deprecated, special-use)
+		"168.63.129.16/32", // Azure wireserver/metadata (routable but infra-only)
 		"64:ff9b::/96",    // NAT64 (embeds an IPv4 address)
 		"64:ff9b:1::/48",  // local NAT64
 		"100::/64",        // discard
@@ -473,6 +481,9 @@ var nonPublicPrefixes = func() []netip.Prefix {
 		"2001:db8::/32",   // documentation
 		"2002::/16",       // 6to4 (embeds an IPv4 address)
 		"fc00::/7",        // unique local
+		"::/96",           // IPv4-compatible IPv6 (embeds an IPv4 address)
+		"fec0::/10",       // deprecated site-local
+		"3fff::/20",       // documentation (RFC 9637)
 	} {
 		out = append(out, netip.MustParsePrefix(p))
 	}
