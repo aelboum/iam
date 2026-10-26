@@ -87,20 +87,58 @@ them as documented in "Secret injection" below.
 
 ## 4. Migrations, backup/restore, recovery time, rollback (WS9 / WS4)
 
-- [ ] Run [`scripts/migration_rehearsal.sh`](../scripts/migration_rehearsal.sh)
+- [x] Run [`scripts/migration_rehearsal.sh`](../scripts/migration_rehearsal.sh)
       against the staging engine image; retain its `ALL_PASS` log (fresh install,
       backup/restore to an isolated target, pre-0007 upgrade path).
 - [ ] Confirm on the live staging DB: `schema_migrations` lists every migration;
       health check passes; a real login flow succeeds; audit events are written.
-- [ ] **Real backup tooling** (not just the rehearsal script): take a backup with
+      *(Partly done: live `schema_migrations=7` and `/healthz` pass confirmed, and
+      real Google/Entra logins succeeded under HTTPS staging — §§ 1–2 / ROADMAP
+      WS5/WS7; writing of audit events was not separately verified in this run.)*
+- [x] **Real backup tooling** (not just the rehearsal script): take a backup with
       the environment's actual tooling, restore it onto an **isolated target
       first**, validate schema + data there before any reuse.
-- [ ] **Measure and record recovery time** (backup → validated restore) so an
+- [x] **Measure and record recovery time** (backup → validated restore) so an
       incident has a known bound.
 - [ ] **Rollback criteria rehearsed** (STAGING.md § *Rollback and recovery
       criteria*): abort conditions defined; understand that a binary rollback
       does **not** undo committed schema (0006/0007); schema + binary recovery
       decided together.
+
+> **Status — staging recovery rehearsal (2026-10-26):** executed against the running
+> HTTPS staging stack.
+> - **Audited rehearsal** (`scripts/migration_rehearsal.sh`, **unchanged**, run with
+>   the `iam-staging-iam:latest` engine image): **ALL_PASS** — fresh install applies
+>   all 7 migrations in order; a `pg_dump` backup restores onto a *separate* isolated
+>   target with identical `schema_migrations` and seeded data and zero further
+>   migrations; the pre-0007 database upgrades by applying exactly 0007 with the legacy
+>   generic-OIDC provider defaulting to `provider_type='oidc'` and an empty tenant. It
+>   created only disposable `iam-rehearsal-*` resources and removed them on exit (0 left
+>   behind); the live staging stack and its volume were untouched.
+> - **Real backup/restore of the live staging DB:** a `pg_dump` of the live staging
+>   database (read-only on the source) restored onto a fresh, isolated disposable
+>   Postgres target and validated there — `schema_migrations=7` and 24 public tables
+>   (including `orgs`, `users`, `identity_providers`, `sessions`, `idp_intents`).
+> - **Recovery time: 4.90 s.** T0 = start of `pg_dump` of the live staging DB; T1 =
+>   isolated target restored and validated (`schema_migrations==7`); the span includes
+>   provisioning the throwaway target, the restore, and validation. Backup size ≈ 40 KB.
+>   **Representativeness caveat:** the staging DB was nearly empty (no organizations
+>   remained after the federation tests were cleaned up), so this figure is **not** a
+>   reliable predictor of production recovery under realistic load or larger datasets.
+> - **Limited staging smoke test:** `/healthz` 200, discovery `issuer` matches, JWKS has
+>   1 key, authorize and token endpoints present.
+> - **Method notes (honest disclosure):** the first manual recovery-time attempt hit a
+>   target-readiness race whose error was masked by a `|| true` in the measurement
+>   wrapper; the recorded measurement re-ran with an explicit readiness check and
+>   `ON_ERROR_STOP=1` restore error handling. The audited `migration_rehearsal.sh` was
+>   **not modified**; running it on the VPS needed an engine-image override
+>   (`IAM_REHEARSAL_IMAGE=iam-staging-iam:latest`) and a temporary `python`→`python3`
+>   PATH shim, because the script's default image name and `python` command are not
+>   present there. All disposable resources were removed afterward (verified).
+>
+> **Still open (unchecked above):** live-DB audit-event write verification, and the
+> **rollback-criteria rehearsal**; see also § 3 (staging-config sign-off) and § 5
+> (external pentest). Production remains **NO-GO**.
 
 ## 5. External penetration test and evidence retention
 
