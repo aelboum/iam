@@ -27,8 +27,9 @@ All must be **non-production** and disposable:
    `https://<staging-host>/idp/callback`:
    - **Google** — the WS5 OAuth client, or a staging-specific one, with the
      staging redirect URI added.
-   - **Microsoft personal (WS6)** — *currently deferred* (see ROADMAP.md);
-     fold in once the Azure app-registration access issue is resolved.
+   - **Microsoft personal (WS6)** — *out of the initial production scope*
+     (see ROADMAP.md WS6); not part of this staging rehearsal unless a future
+     release adds MSA to scope.
    - **Microsoft Entra (WS7)** — a test directory, app registration, directory
      GUID, a test user, and one out-of-directory identity for the mandatory
      cross-tenant rejection gate.
@@ -69,8 +70,9 @@ Set on the staging engine, and confirm each at boot:
    directory, plus the **mandatory cross-tenant rejection gate**: a login
    attempt with an identity outside the configured directory must be rejected
    (issuer mismatch; strict equality).
-5. **Microsoft personal (WS6).** Deferred — run once unblocked; same shape as
-   Google, issuer pinned to the consumers tenant.
+5. **Microsoft personal (WS6).** Out of initial scope (ROADMAP.md WS6) — not run
+   for the initial release. If a future release adds MSA, run it here: same shape
+   as Google, issuer pinned to the consumers tenant.
 6. **Backup/restore of the staging database** using the environment's real
    backup tooling (not just the rehearsal script), restored to an isolated
    target and validated before any reuse.

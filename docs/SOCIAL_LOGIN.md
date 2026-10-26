@@ -32,9 +32,16 @@ email.
 | provider_type | Accounts | Issuer (pinned) |
 |---|---|---|
 | `google` | Google accounts | `https://accounts.google.com` |
-| `microsoft` | Microsoft personal accounts (MSA) only | `https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0` |
+| `microsoft` | Microsoft personal accounts (MSA) only — **out of initial scope (see note)** | `https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0` |
 | `entra` | one Microsoft Entra directory | `https://login.microsoftonline.com/<tenant-GUID>/v2.0` |
 | `oidc` | any generic OIDC provider | admin-supplied `issuer` |
+
+**Personal Microsoft accounts (`microsoft`) are out of the initial production
+scope.** The preset remains in the codebase (it is an ordinary OIDC preset), but
+personal-MSA sign-in has had **no live validation** and is **not** a supported
+sign-in option for the initial release — do not rely on it in production. See
+ROADMAP.md WS6 (deferred / out of initial scope, not passed). Organizational
+Microsoft Entra (`entra`) and generic `oidc` are unaffected.
 
 **Not supported in this release:** multi-tenant Microsoft (`common` /
 `organizations`). Those use a templated issuer (`.../{tenantid}/v2.0`) that the
@@ -104,10 +111,21 @@ be treated as verified (the "nOAuth" class of attack). To restrict an Entra
 provider, pin it to the directory's tenant GUID (which already limits it to that
 directory) rather than relying on an email-domain allowlist.
 
-## Live verification (outstanding)
+## Live verification
 
 Creating a provider stores configuration only and makes no network call, so the
 configuration, validation, and tenant-pinning paths are covered by automated
-tests without credentials. A full login round trip against real Google and
-Microsoft tenants requires registered apps and real client secrets and has not
-been run in this environment; it remains an explicit pre-production step.
+tests without credentials.
+
+Full login round trips have since been run against a disposable local
+non-production engine (`http://localhost:8080`, `IAM_DEV_MODE=true`) with
+dedicated non-production app registrations:
+
+- **Google (`google`)** — PASS, 2026-10-25 (ROADMAP.md WS5).
+- **Microsoft Entra (`entra`)** — PASS, 2026-10-26, including the live
+  cross-tenant rejection gate (ROADMAP.md WS7).
+- **Microsoft personal (`microsoft`, MSA)** — **not run; out of initial scope**
+  (ROADMAP.md WS6).
+
+These were under plain HTTP on localhost. A repeat under real HTTPS staging
+(dev mode off) remains an explicit pre-production step (ROADMAP.md WS9).

@@ -94,14 +94,16 @@ them as documented in "Secret injection" below.
       SECURITY.md's residual-risk register.
 - [ ] Retain the pentest report and remediation evidence with the release record.
 
-## Supported-scope decision (gates GO)
+## Supported-scope decision (resolved 2026-10-26)
 
-- [ ] Production scope explicitly states which federated providers are supported.
-- [ ] If **personal Microsoft accounts (WS6)** are in scope: resolve the Azure
-      access issue and pass a live MSA round trip (same shape as Entra, issuer
-      pinned to the consumers tenant). If **not** in scope: declare MSA out of
-      scope and drop WS6. GO must not treat a deferred, never-tested provider as
-      available.
+- [x] Production scope states the supported federated providers: Google
+      (`google`), organizational Microsoft Entra (`entra`), and generic `oidc`.
+- [x] **Personal Microsoft accounts (MSA, `microsoft`) are excluded from the
+      initial release.** WS6 is out of initial scope — deferred, not passed; the
+      preset stays in the code but is unvalidated and unsupported for production.
+      GO does not require WS6. (If a future release adds MSA, a live round trip
+      — same shape as Entra, issuer pinned to the consumers tenant — is required
+      first.)
 
 When every applicable box is checked with retained evidence and all SECURITY.md
 residual risks remain accepted, the go/no-go in ROADMAP.md can be revisited.

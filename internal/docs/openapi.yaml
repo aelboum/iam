@@ -638,7 +638,7 @@ paths:
         `provider_type` selects a preset:
           - `oidc` (default): a generic provider; you supply `issuer` (https, public host).
           - `google`: Google accounts; issuer is pinned to `https://accounts.google.com`.
-          - `microsoft`: Microsoft personal accounts (MSA) only; issuer pinned to the consumers tenant.
+          - `microsoft`: Microsoft personal accounts (MSA) only; issuer pinned to the consumers tenant. Out of the initial supported scope and not live-validated — not recommended for production (see ROADMAP WS6).
           - `entra`: one Microsoft Entra ID directory; set `tenant` to the directory (tenant) GUID.
         For a preset the engine pins and validates the issuer, so `issuer` must be omitted and
         tokens from any other tenant/issuer are rejected. Outside dev mode a generic issuer must
