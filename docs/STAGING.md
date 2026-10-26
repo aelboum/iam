@@ -142,6 +142,30 @@ docker compose -f docker-compose.staging.yml exec -T postgres \
   psql -U iam -d iam -c "select version from schema_migrations order by version;"
 ```
 
+Confirm the **running** engine advertises the expected issuer. This is a
+separate check from the `IAM_DEV_MODE=false` refusal test above and does **not**
+replace it — the issuer value alone does not prove dev mode is off. It fails on
+any mismatch or HTTP error (export `IAM_DOMAIN` first):
+
+```
+python3 - "$IAM_DOMAIN" <<'PY'
+import json, sys, urllib.request
+host = sys.argv[1]
+want = "https://%s" % host
+url = want + "/.well-known/openid-configuration"
+try:
+    with urllib.request.urlopen(url, timeout=5) as r:
+        if r.status != 200:
+            sys.exit("FAIL: discovery returned HTTP %s" % r.status)
+        issuer = json.load(r).get("issuer")
+except Exception as e:
+    sys.exit("FAIL: discovery request failed: %s" % e)
+if issuer != want:
+    sys.exit("FAIL: advertised issuer %r != expected %r" % (issuer, want))
+print("OK: issuer == %s" % issuer)
+PY
+```
+
 Then run the live round trips and suites against the staging issuer (see
 `.env.staging.example` harness section and steps 3–5 above):
 `python scripts/smoke_test.py https://<IAM_DOMAIN>` and the Google/Entra
@@ -150,28 +174,82 @@ federation harness pointed at the same issuer.
 ### Backup, restore, and recovery-time measurement
 
 Database access is private to the compose network; reach it through the
-container. Restore onto an **isolated** target and validate before trusting it.
+container. Write every dump **outside the cloned repository** — dumps contain
+data and at-rest-encrypted secrets and must never be committed (`*.dump` is
+git-ignored as a backstop). Use a directory such as `~/iam-backups` on the VM.
 
 ```
-# Timed backup:
-time docker compose -f docker-compose.staging.yml exec -T postgres \
-  pg_dump -U iam -Fc iam > iam-staging-$(date +%Y%m%d%H%M%S).dump
+mkdir -p ~/iam-backups
+STAMP=$(date +%Y%m%d%H%M%S); DUMP=~/iam-backups/iam-staging-$STAMP.dump
 
-# Restore onto a SEPARATE scratch database and validate there (never over the live DB):
+# Timed backup — this is the RETAINED artifact:
+time docker compose -f docker-compose.staging.yml exec -T postgres \
+  pg_dump -U iam -Fc iam > "$DUMP"
+
+# The file existing is NOT proof of validity; only check it is present and a
+# plausible non-zero size here (the restore test below is what proves it):
+test -s "$DUMP" && echo "backup present: $(wc -c < "$DUMP") bytes" \
+  || echo "FAIL: backup missing or empty"
+```
+
+Validate by restoring into a SEPARATE, TEMPORARY database — never over the live
+one. `restore_check` is a throwaway restore-test artifact, not a backup to keep:
+
+```
 docker compose -f docker-compose.staging.yml exec -T postgres \
   psql -U iam -d postgres -c "create database restore_check;"
 time docker compose -f docker-compose.staging.yml exec -T postgres \
-  pg_restore -U iam -d restore_check --no-owner < iam-staging-<stamp>.dump
+  pg_restore -U iam -d restore_check --no-owner < "$DUMP"
 docker compose -f docker-compose.staging.yml exec -T postgres \
   psql -U iam -d restore_check -c "select count(*) from schema_migrations;"
+# Drop the throwaway once the restore is validated:
+docker compose -f docker-compose.staging.yml exec -T postgres \
+  psql -U iam -d postgres -c "drop database restore_check;"
 ```
 
 Record the two `time` figures; their sum is the measured recovery bound for an
-incident. For the migration + upgrade rehearsal (fresh install, backup/restore,
-pre-0007 upgrade) reuse the existing script rather than re-deriving it:
-`scripts/migration_rehearsal.sh` — retain its `ALL_PASS` log.
+incident. Retain only the validated `$DUMP`; the `restore_check` database is
+temporary.
+
+**Preserve the backup off the VM before any teardown.** Copy the retained dump
+to storage outside the VM and confirm it is readable at the destination before
+destroying the VM or its volumes:
+
+```
+# From your workstation (not the VM):
+scp <vm-user>@<vm-host>:~/iam-backups/iam-staging-<stamp>.dump ./secure-store/
+test -s ./secure-store/iam-staging-<stamp>.dump \
+  && echo "offsite copy present: $(wc -c < ./secure-store/iam-staging-<stamp>.dump) bytes" \
+  || echo "FAIL: offsite copy missing or empty"
+```
+
+Treat the dump as sensitive (data + sealed secrets): store it encrypted and
+never print its contents. For the migration + upgrade rehearsal (fresh install,
+backup/restore, pre-0007 upgrade) reuse the existing script rather than
+re-deriving it: `scripts/migration_rehearsal.sh` — retain its `ALL_PASS` log.
+
+### Administrative access (staging decision)
+
+The engine exposes a single `/v1` API surface: the login API (called by operator
+backends) and the management API share that prefix and are separated by **key
+scope** — `requireAdminScope` — not by URL path
+(`internal/api/api.go:55-156`), and admin routes interleave with login routes. A
+network-level edge allowlist therefore cannot single out admin calls without
+either blocking ordinary login traffic (allowlisting all of `/v1`) or relying on
+a fragile, drift-prone list of admin paths, so **no IP allowlist is added** here:
+either option risks locking us out or giving false security. Management access is
+enforced by admin-scoped bearer keys plus management rate limiting
+(`limitManagement` / the `mgmt-key` limiter), and `/docs` is refused at the edge
+and disabled in the engine. If network-level restriction is required for staging,
+treat it as a deliberate architecture decision — for example run admin calls from
+the VM itself over SSH/localhost, or front the management plane with a separate
+restricted entrypoint bound to a known static operator IP — rather than guessing
+an allowlist.
 
 ### Teardown (what exactly gets removed)
+
+Make sure the backup has been preserved off the VM first (previous section);
+`down -v` deletes the `pgdata` volume, so an un-exported dump is lost.
 
 ```
 # Removes ONLY the iam-staging project's containers, the default network, and the
