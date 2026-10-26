@@ -495,15 +495,9 @@ def main():
     # fix the passkey/federated/finalize paths used IsLocked() (which includes
     # the temporary lockout), so password guessing denied all factors.
     api(key, "PUT", f"/users/{pia['id']}/password", {"password": "correct-horse-xfactor-1"})
-    lock_sess = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": "pia"})
-    for _ in range(5):
-        http("POST", f"/v1/sessions/{lock_sess['session_id']}/password",
-             {"session_token": lock_sess["session_token"], "password": "definitely-wrong"},
-             {"Authorization": "Bearer " + login_key})
-    ps = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": "pia"})
-    pstatus, _, _ = http("POST", f"/v1/sessions/{ps['session_id']}/password",
-                         {"session_token": ps["session_token"], "password": "correct-horse-xfactor-1"},
-                         {"Authorization": "Bearer " + login_key})
+    for _ in range(5):  # a fresh session per guess, like the smoke lockout test
+        t.password_step(login_key, acme["slug"], "pia", "definitely-wrong")
+    _, pstatus, _ = t.password_step(login_key, acme["slug"], "pia", "correct-horse-xfactor-1")
     check(pstatus == 401, "the password factor is locked after repeated failures")
     xs = api(login_key, "POST", "/sessions", {"org": acme["slug"], "login_name": "pia"})
     xo = api(login_key, "POST", f"/sessions/{xs['session_id']}/passkey/begin", {"session_token": xs["session_token"]})
