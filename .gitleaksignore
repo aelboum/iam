@@ -2,7 +2,10 @@
 # weaken detection of any other secret).
 #
 # A synthetic test-fixture password in the end-to-end suite (not a credential to
-# any system) tripped the generic-api-key heuristic in a published commit, which
-# cannot be rewritten. The current value was changed to a low-entropy form so no
-# new finding is produced; this suppresses only the historical occurrence.
+# any system) tripped the generic-api-key heuristic. The value was changed to the
+# repo's proven low-entropy convention so no new finding is produced going
+# forward; these two entries suppress only the two published commits that carried
+# the higher-entropy values (they cannot be rewritten). This does not weaken
+# detection of any other secret.
 48ad1b4a667bfd2d74de906dff3a2c4cb0e06acd:scripts/features_test.py:generic-api-key:423
+f73d34df3b5b92a584514f6f2e7fff6db872a545:scripts/features_test.py:generic-api-key:423
