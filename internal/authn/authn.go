@@ -589,9 +589,10 @@ var hashSlots = make(chan struct{}, sizing.AutoHashSlots())
 // ConfigureHashSlots sets the size of the process-wide hashing pool. It replaces
 // the semaphore, so it must be called once at startup before the engine begins
 // serving — the goroutine-creation that starts the HTTP server establishes the
-// happens-before that makes the new value visible to request handlers. A count
-// below 2 is floored at 2 so the pool is never degenerate. It is a no-op scope
-// for tests, which drive the default pool directly.
+// happens-before that makes the new value visible to request handlers. It must
+// not be called while hashes are in flight: acquireHashSlot captures the channel
+// at call time, so replacing it mid-flight would strand slots on the old pool. A
+// count below 2 is floored at 2 so the pool is never degenerate.
 func ConfigureHashSlots(slots int) {
 	hashSlots = make(chan struct{}, max(2, slots))
 }
@@ -604,9 +605,12 @@ func ConfigureHashSlots(slots int) {
 // ErrRateLimited (N12/R4). It returns a release closure only when a slot was
 // actually acquired, so a timed-out acquire leaks nothing.
 func (s *Service) acquireHashSlot() (func(), error) {
+	// Capture the channel so the release targets the same pool this acquire used,
+	// even if ConfigureHashSlots were to replace the global meanwhile.
+	ch := hashSlots
 	select {
-	case hashSlots <- struct{}{}:
-		return func() { <-hashSlots }, nil
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
 	case <-time.After(s.cfg.HashWaitTimeout):
 		logHashShed(s.cfg.HashWaitTimeout)
 		return nil, ErrOverloaded

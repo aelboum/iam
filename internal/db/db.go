@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"sort"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -68,18 +69,28 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return fmt.Errorf("acquire connection: %w", err)
 	}
-	defer conn.Release()
+	// Release the lock before the connection returns to the pool. A session-level
+	// advisory lock outlives the pool checkout, so an un-released connection would
+	// keep the lock and deadlock every later migrator. Use a fresh context so the
+	// unlock still runs if ctx was cancelled. If the unlock itself fails on a still-
+	// live connection, destroy that connection instead of returning it to the pool,
+	// so the session — and with it the lock — ends.
+	locked := false
+	defer func() {
+		if locked {
+			if _, uerr := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrateAdvisoryLockKey); uerr != nil {
+				slog.Warn("migration advisory unlock failed; discarding connection", "error", uerr)
+				conn.Hijack().Close(context.Background())
+				return
+			}
+		}
+		conn.Release()
+	}()
 
 	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrateAdvisoryLockKey); err != nil {
 		return fmt.Errorf("acquire migration lock: %w", err)
 	}
-	// Release the lock before the connection returns to the pool. A session-level
-	// advisory lock outlives the pool checkout, so an un-released connection would
-	// keep the lock and deadlock every later migrator. Use a fresh context so the
-	// unlock still runs if ctx was cancelled.
-	defer func() {
-		_, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrateAdvisoryLockKey)
-	}()
+	locked = true
 
 	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version text PRIMARY KEY,
