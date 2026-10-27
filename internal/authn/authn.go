@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"runtime"
@@ -67,6 +68,9 @@ type Config struct {
 	// Limits builds the rate limiters (in-memory or shared).
 	Limits          ratelimit.Factory
 	LockoutDuration time.Duration
+	// HashWaitTimeout bounds how long a request waits for a password-hashing
+	// slot before it is shed as ErrRateLimited (internal security audit N12).
+	HashWaitTimeout time.Duration
 }
 
 type Service struct {
@@ -529,9 +533,28 @@ func (s *Service) attemptFailed(ctx context.Context, c Client, user *store.User,
 // 64 MiB, so unbounded parallel requests could exhaust memory.
 var hashSlots = make(chan struct{}, max(2, runtime.NumCPU()))
 
+// acquireHashSlot waits up to HashWaitTimeout for a hashing slot. If none frees
+// in time it sheds the request as ErrRateLimited (mapped to HTTP 429) instead of
+// queueing without bound, so one tenant cannot grow an unbounded hashing backlog
+// for everyone else (internal security audit N12). It returns a release closure
+// only when a slot was actually acquired, so a timed-out acquire leaks nothing.
+func (s *Service) acquireHashSlot() (func(), error) {
+	select {
+	case hashSlots <- struct{}{}:
+		return func() { <-hashSlots }, nil
+	case <-time.After(s.cfg.HashWaitTimeout):
+		// Observability only: a bounded signal with no password, hash, key or token.
+		slog.Warn("password hashing overloaded; shedding request", "wait", s.cfg.HashWaitTimeout.String())
+		return nil, ErrRateLimited
+	}
+}
+
 func (s *Service) verify(hash, password string) (string, error) {
-	hashSlots <- struct{}{}
-	defer func() { <-hashSlots }()
+	release, err := s.acquireHashSlot()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	return s.passwords.Verify(hash, password)
 }
 
@@ -544,8 +567,11 @@ func (s *Service) verifyDummy(password string) {
 }
 
 func (s *Service) hash(password string) (string, error) {
-	hashSlots <- struct{}{}
-	defer func() { <-hashSlots }()
+	release, err := s.acquireHashSlot()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	return s.passwords.Hash(password)
 }
 

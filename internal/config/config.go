@@ -48,6 +48,10 @@ type Config struct {
 	MaxFailedLogins     int
 	LockoutDuration     time.Duration
 	AuditRetention      time.Duration
+	// HashWaitTimeout bounds how long a request waits for a password-hashing
+	// slot before it is shed as rate-limited, so one tenant cannot grow an
+	// unbounded hashing backlog for everyone else (internal security audit N12).
+	HashWaitTimeout time.Duration
 
 	// Passkeys: the relying party ID (a domain) and the login UI origins.
 	WebAuthnRPID    string
@@ -96,6 +100,7 @@ func Load() (*Config, error) {
 		{&cfg.KeyRotationInterval, "IAM_KEY_ROTATION", 30 * 24 * time.Hour},
 		{&cfg.LockoutDuration, "IAM_LOCKOUT_DURATION", 15 * time.Minute},
 		{&cfg.AuditRetention, "IAM_AUDIT_RETENTION", 365 * 24 * time.Hour},
+		{&cfg.HashWaitTimeout, "IAM_HASH_WAIT_TIMEOUT", 3 * time.Second},
 	}
 	for _, d := range durations {
 		v, err := time.ParseDuration(env(d.name, d.fallback.String()))
