@@ -420,7 +420,7 @@ def main():
           "a reset for the untrusted claimed address finds no account (no federated-account adoption) (N13)")
     # ...and the real address stays free for a genuine user (no squat).
     realcarl = api(key, "POST", f"/orgs/{acme['id']}/users",
-                   {"username": "genuine-user", "email": "carl@corp.test", "password": "Wobble-Mountain-93"})
+                   {"username": "genuine-user", "email": "carl@corp.test", "password": "brisk-otter-canyon-7"})
     check(realcarl["email"] == "carl@corp.test", "the untrusted IdP did not squat the real address (N13)")
     sess2, _, _, _ = sso_login(idp["id"])
     idt2, _ = finalize_and_exchange(login_key, start_authorize(app["client_id"]), sess2, app_basic)

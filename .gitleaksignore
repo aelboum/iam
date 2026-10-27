@@ -1,0 +1,8 @@
+# Reviewed gitleaks false positives (exact fingerprints only; this does not
+# weaken detection of any other secret).
+#
+# A synthetic test-fixture password in the end-to-end suite (not a credential to
+# any system) tripped the generic-api-key heuristic in a published commit, which
+# cannot be rewritten. The current value was changed to a low-entropy form so no
+# new finding is produced; this suppresses only the historical occurrence.
+48ad1b4a667bfd2d74de906dff3a2c4cb0e06acd:scripts/features_test.py:generic-api-key:423
