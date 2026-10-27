@@ -32,11 +32,20 @@ var (
 	// ErrInvalidCredentials is deliberately vague to avoid user enumeration.
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrLocked             = errors.New("user is locked")
-	ErrRateLimited        = errors.New("too many attempts, try again later")
-	ErrSessionInvalid     = errors.New("session invalid or expired")
-	ErrNotAuthenticated   = errors.New("session is not fully authenticated")
-	ErrNoAccess           = errors.New("user's org has no access to this application")
-	ErrTOTPNotEnrolled    = errors.New("totp not enrolled")
+	// ErrRateLimited is a caller- or tenant-attributable limit: a hard IP/key/
+	// account limiter or the per-org password-login budget (A4). It maps to HTTP
+	// 429 with a window-length Retry-After.
+	ErrRateLimited = errors.New("too many attempts, try again later")
+	// ErrOverloaded is a transient, server-side shed: all argon2 hashing slots
+	// were busy past HashWaitTimeout. It is not caller-specific and clears in
+	// sub-second to a few seconds, so it maps to HTTP 503 with a short Retry-After,
+	// distinct from the caller-attributable ErrRateLimited (internal security
+	// audit N12/R4). On the OIDC token endpoint it surfaces as server_error.
+	ErrOverloaded       = errors.New("authentication temporarily overloaded")
+	ErrSessionInvalid   = errors.New("session invalid or expired")
+	ErrNotAuthenticated = errors.New("session is not fully authenticated")
+	ErrNoAccess         = errors.New("user's org has no access to this application")
+	ErrTOTPNotEnrolled  = errors.New("totp not enrolled")
 )
 
 // WeakPasswordError explains why a password was rejected.
@@ -70,7 +79,7 @@ type Config struct {
 	Limits          ratelimit.Factory
 	LockoutDuration time.Duration
 	// HashWaitTimeout bounds how long a request waits for a password-hashing
-	// slot before it is shed as ErrRateLimited (internal security audit N12).
+	// slot before it is shed as ErrOverloaded (internal security audit N12).
 	HashWaitTimeout time.Duration
 	// OrgLoginLimit is the per-organization password-login budget (attempts per
 	// minute, aggregated across the org's keys/accounts/IPs) (audit N12/A4).
@@ -155,7 +164,7 @@ func (s *Service) HashSecret(v string) (string, error) {
 
 // VerifySecret checks a client secret against its hash. It returns (true, nil)
 // on a match, (false, nil) for a genuine mismatch, and (false, err) for an
-// overload (ErrRateLimited) or other error, so a hashing-overload shed is never
+// overload (ErrOverloaded) or other error, so a hashing-overload shed is never
 // reported as an invalid secret. It never returns (true, err) (internal security
 // audit N12/R1). Callers must fail closed on a non-nil error (never grant) and
 // should surface it as a transient/overload response, not invalid_client.
@@ -562,17 +571,19 @@ func (s *Service) attemptFailed(ctx context.Context, c Client, user *store.User,
 var hashSlots = make(chan struct{}, max(2, runtime.NumCPU()))
 
 // acquireHashSlot waits up to HashWaitTimeout for a hashing slot. If none frees
-// in time it sheds the request as ErrRateLimited (mapped to HTTP 429) instead of
+// in time it sheds the request as ErrOverloaded (mapped to HTTP 503) instead of
 // queueing without bound, so one tenant cannot grow an unbounded hashing backlog
-// for everyone else (internal security audit N12). It returns a release closure
-// only when a slot was actually acquired, so a timed-out acquire leaks nothing.
+// for everyone else (internal security audit N12). The shed is a transient
+// server condition, not a caller-attributable limit, so it is distinct from
+// ErrRateLimited (N12/R4). It returns a release closure only when a slot was
+// actually acquired, so a timed-out acquire leaks nothing.
 func (s *Service) acquireHashSlot() (func(), error) {
 	select {
 	case hashSlots <- struct{}{}:
 		return func() { <-hashSlots }, nil
 	case <-time.After(s.cfg.HashWaitTimeout):
 		logHashShed(s.cfg.HashWaitTimeout)
-		return nil, ErrRateLimited
+		return nil, ErrOverloaded
 	}
 }
 

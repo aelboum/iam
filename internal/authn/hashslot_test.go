@@ -37,8 +37,8 @@ func TestAcquireHashSlotShedsWhenFull(t *testing.T) {
 	s := &Service{cfg: Config{HashWaitTimeout: 50 * time.Millisecond}}
 	start := time.Now()
 	release, err := s.acquireHashSlot()
-	if !errors.Is(err, ErrRateLimited) || release != nil {
-		t.Fatalf("full pool: got release!=nil=%v err=%v, want nil release + ErrRateLimited", release != nil, err)
+	if !errors.Is(err, ErrOverloaded) || release != nil {
+		t.Fatalf("full pool: got release!=nil=%v err=%v, want nil release + ErrOverloaded", release != nil, err)
 	}
 	if d := time.Since(start); d < 40*time.Millisecond || d > 2*time.Second {
 		t.Fatalf("shed after %v; want ~the timeout, not an indefinite wait", d)
@@ -90,8 +90,8 @@ func newVerifyTestService(timeout time.Duration) *Service {
 	}
 }
 
-// R1: VerifySecret must distinguish a genuine mismatch (false, nil) from an
-// overload shed (false, ErrRateLimited), and never report overload as invalid.
+// R1/R4: VerifySecret must distinguish a genuine mismatch (false, nil) from an
+// overload shed (false, ErrOverloaded), and never report overload as invalid.
 func TestVerifySecretContract(t *testing.T) {
 	drainHashSlots()
 	defer drainHashSlots()
@@ -106,7 +106,7 @@ func TestVerifySecretContract(t *testing.T) {
 	if ok, err := s.VerifySecret(h, "the-wrong-secret"); ok || err != nil {
 		t.Fatalf("wrong secret: ok=%v err=%v, want false,nil (genuine mismatch)", ok, err)
 	}
-	// Overload: a full pool makes verify shed; it must surface as ErrRateLimited,
+	// Overload: a full pool makes verify shed; it must surface as ErrOverloaded,
 	// not as a (false, nil) invalid-secret result.
 	for i := 0; i < cap(hashSlots); i++ {
 		hashSlots <- struct{}{}
@@ -115,8 +115,8 @@ func TestVerifySecretContract(t *testing.T) {
 	for i := 0; i < cap(hashSlots); i++ {
 		<-hashSlots
 	}
-	if ok || !errors.Is(err, ErrRateLimited) {
-		t.Fatalf("overload: ok=%v err=%v, want false + ErrRateLimited (not a mismatch)", ok, err)
+	if ok || !errors.Is(err, ErrOverloaded) {
+		t.Fatalf("overload: ok=%v err=%v, want false + ErrOverloaded (not a mismatch)", ok, err)
 	}
 }
 
@@ -149,8 +149,8 @@ func TestHashShedLogThrottled(t *testing.T) {
 	}
 	s := &Service{cfg: Config{HashWaitTimeout: 10 * time.Millisecond}}
 	for i := 0; i < 20; i++ {
-		if _, err := s.acquireHashSlot(); !errors.Is(err, ErrRateLimited) {
-			t.Fatalf("acquire %d: err=%v, want ErrRateLimited", i, err)
+		if _, err := s.acquireHashSlot(); !errors.Is(err, ErrOverloaded) {
+			t.Fatalf("acquire %d: err=%v, want ErrOverloaded", i, err)
 		}
 	}
 	for i := 0; i < cap(hashSlots); i++ {
