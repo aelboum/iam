@@ -475,7 +475,16 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 		}
 	}
 	if !reserved || !user.HasPassword() || utf8.RuneCountInString(password) > maxPasswordLength {
-		s.verifyDummy(password)
+		// If hashing was shed under overload, the dummy check could not run, so
+		// surface overload rather than invalid credentials — otherwise a known
+		// user (503) and an unknown or locked one (401) would differ under load,
+		// leaking which accounts exist (internal security audit N12).
+		if errors.Is(s.verifyDummy(password), ErrOverloaded) {
+			if reserved {
+				s.releaseAttempt(ctx, user.ID)
+			}
+			return nil, ErrOverloaded
+		}
 		if reserved {
 			return nil, s.attemptFailed(ctx, c, user, store.FactorPassword)
 		}
@@ -486,10 +495,15 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 	}
 	updated, verr := s.verify(*user.PasswordHash, password)
 	if verr != nil {
-		if !errors.Is(verr, passwap.ErrPasswordMismatch) {
-			return nil, verr
+		if errors.Is(verr, passwap.ErrPasswordMismatch) {
+			return nil, s.attemptFailed(ctx, c, user, store.FactorPassword)
 		}
-		return nil, s.attemptFailed(ctx, c, user, store.FactorPassword)
+		// A non-mismatch error (hash overload shed, or an internal hashing error)
+		// means the password was never evaluated. Release the reserved attempt so
+		// a transient shed does not count as a failure and push a real user toward
+		// lockout, then surface the error (internal security audit N12).
+		s.releaseAttempt(ctx, user.ID)
+		return nil, verr
 	}
 	if updated != "" {
 		// Upgrade the hash only if it was not changed meanwhile (e.g. an admin reset).
@@ -642,12 +656,28 @@ func (s *Service) verify(hash, password string) (string, error) {
 	return s.passwords.Verify(hash, password)
 }
 
-// verifyDummy spends the time of a real check, for unknown or locked users.
-func (s *Service) verifyDummy(password string) {
+// verifyDummy spends the time of a real check, for unknown or locked users, so
+// response time does not reveal them. It returns ErrOverloaded when hashing was
+// shed, so the caller can report overload uniformly instead of as invalid
+// credentials (internal security audit N12); a mismatch against the dummy hash
+// is expected and reported as nil.
+func (s *Service) verifyDummy(password string) error {
 	if len(password) > maxPasswordLength*4 {
 		password = password[:maxPasswordLength*4]
 	}
-	_, _ = s.verify(s.dummyHash, password)
+	if _, err := s.verify(s.dummyHash, password); errors.Is(err, ErrOverloaded) {
+		return ErrOverloaded
+	}
+	return nil
+}
+
+// releaseAttempt best-effort undoes a reserved login attempt that was never
+// evaluated because hashing was shed. A failure here must not mask the error
+// already being returned to the caller, so it is only logged.
+func (s *Service) releaseAttempt(ctx context.Context, userID string) {
+	if err := s.store.ReleaseAttempt(ctx, userID, store.FactorPassword); err != nil {
+		slog.Warn("could not release an unevaluated login attempt", "error", err)
+	}
 }
 
 func (s *Service) hash(password string) (string, error) {

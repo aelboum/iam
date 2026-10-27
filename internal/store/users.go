@@ -254,6 +254,19 @@ func (s *Store) AttemptSucceeded(ctx context.Context, id string, f Factor) error
 	return s.execOne(ctx, `UPDATE users SET `+string(f)+` = 0 WHERE id = $1`, id)
 }
 
+// ReleaseAttempt undoes a ReserveAttempt that was never settled by a success or
+// a failure — for example when hashing was shed under overload before the
+// password could be evaluated. It decrements only the single attempt it
+// reserved (never below zero, so a concurrent reservation is left intact),
+// instead of clearing the counter, so a transient shed cannot advance a real
+// user toward lockout (internal security audit N12).
+func (s *Store) ReleaseAttempt(ctx context.Context, id string, f Factor) error {
+	col := string(f) // fixed column name, never user input
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET `+col+` = `+col+` - 1 WHERE id = $1 AND `+col+` > 0`, id)
+	return mapErr(err)
+}
+
 // UpgradePasswordHash replaces a hash with a stronger one, but only if it is
 // still oldHash, so it can never undo a concurrent password change.
 func (s *Store) UpgradePasswordHash(ctx context.Context, id, oldHash, newHash string) error {
