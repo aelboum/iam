@@ -124,6 +124,7 @@ func run() error {
 		MaxFailedLogins:  cfg.MaxFailedLogins,
 		LockoutDuration:  cfg.LockoutDuration,
 		HashWaitTimeout:  cfg.HashWaitTimeout,
+		OrgLoginLimit:    cfg.OrgLoginLimit,
 		CodeKey:          secret.Derive(cfg.MasterKey, "email-code-hmac"),
 		PreviousCodeKeys: previousCodeKeys,
 	})

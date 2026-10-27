@@ -52,6 +52,11 @@ type Config struct {
 	// slot before it is shed as rate-limited, so one tenant cannot grow an
 	// unbounded hashing backlog for everyone else (internal security audit N12).
 	HashWaitTimeout time.Duration
+	// OrgLoginLimit caps password-login (argon2) attempts per organization per
+	// minute, aggregated across all of that org's keys, accounts and IPs, so one
+	// tenant cannot monopolize the shared hashing capacity (internal security
+	// audit N12/A4).
+	OrgLoginLimit int
 
 	// Passkeys: the relying party ID (a domain) and the login UI origins.
 	WebAuthnRPID    string
@@ -109,6 +114,11 @@ func Load() (*Config, error) {
 		}
 		*d.dst = v
 	}
+	orgLimit, err := strconv.Atoi(env("IAM_ORG_LOGIN_LIMIT", "1200"))
+	if err != nil || orgLimit <= 0 {
+		return nil, errors.New("IAM_ORG_LOGIN_LIMIT must be a positive integer (password logins per org per minute)")
+	}
+	cfg.OrgLoginLimit = orgLimit
 	if cfg.Issuer == "" {
 		return nil, errors.New("IAM_ISSUER is required")
 	}

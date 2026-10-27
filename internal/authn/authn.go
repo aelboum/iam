@@ -72,6 +72,9 @@ type Config struct {
 	// HashWaitTimeout bounds how long a request waits for a password-hashing
 	// slot before it is shed as ErrRateLimited (internal security audit N12).
 	HashWaitTimeout time.Duration
+	// OrgLoginLimit is the per-organization password-login budget (attempts per
+	// minute, aggregated across the org's keys/accounts/IPs) (audit N12/A4).
+	OrgLoginLimit int
 }
 
 type Service struct {
@@ -81,6 +84,9 @@ type Service struct {
 	cfg       Config
 	// accountLimit caps password/TOTP attempts per user, whatever the source IP.
 	accountLimit ratelimit.Allower
+	// orgLogin caps password-login (argon2) attempts per org, aggregated across
+	// all of the org's keys, accounts and IPs (internal security audit N12/A4).
+	orgLogin ratelimit.Allower
 	// dummyHash is verified for unknown users so response time does not reveal them.
 	dummyHash string
 	// httpClient talks to external identity providers (SSRF-guarded).
@@ -100,8 +106,10 @@ func NewService(st *store.Store, box *secret.Box, cfg Config) *Service {
 		),
 		cfg:          cfg,
 		accountLimit: cfg.Limits("login-account", 10, 10),
-		httpClient:   NewOutboundClient(cfg.DevMode),
-		webauthn:     cfg.WebAuthn,
+		// Burst a quarter of the per-minute budget, mirroring the login-key limiter.
+		orgLogin:   cfg.Limits("login-org", float64(cfg.OrgLoginLimit), max(1, cfg.OrgLoginLimit/4)),
+		httpClient: NewOutboundClient(cfg.DevMode),
+		webauthn:   cfg.WebAuthn,
 	}
 	hash, err := s.passwords.Hash(secret.Token(16))
 	if err != nil {
@@ -435,6 +443,15 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 	if !s.accountLimit.Allow(attemptKey(sess)) {
 		return nil, ErrRateLimited
 	}
+	// Per-org aggregate cap on password-login hashing, so one tenant cannot
+	// monopolize the shared argon2 slots across many keys, accounts or IPs
+	// (internal security audit N12/A4). Keyed on the server-resolved org id;
+	// checked once per attempt, before any lockout counter or hashing, so a
+	// shed attempt neither counts toward lockout nor spends a hash slot.
+	if !s.orgLogin.Allow(sess.OrgID) {
+		logOrgLoginLimited(sess.OrgID)
+		return nil, ErrRateLimited
+	}
 	// Reserve the attempt before verifying, so parallel guesses cannot exceed
 	// the lockout threshold. Unknown and locked users take the same path and
 	// time, and get the same answer as a wrong password; a locked account's
@@ -573,6 +590,23 @@ func logHashShed(wait time.Duration) {
 	last := hashShedLogAt.Load()
 	if now-last >= int64(time.Second) && hashShedLogAt.CompareAndSwap(last, now) {
 		slog.Warn("password hashing overloaded; shedding requests", "shed_total", total, "wait", wait.String())
+	}
+}
+
+// per-org login-budget observability: count every denial but log at most once
+// per second with the running total, so it cannot flood the logs. The org id is
+// an identifier, not a secret; no password/token is logged (audit N12/A4/R3).
+var (
+	orgLimitTotal atomic.Int64
+	orgLimitLogAt atomic.Int64
+)
+
+func logOrgLoginLimited(orgID string) {
+	total := orgLimitTotal.Add(1)
+	now := time.Now().UnixNano()
+	last := orgLimitLogAt.Load()
+	if now-last >= int64(time.Second) && orgLimitLogAt.CompareAndSwap(last, now) {
+		slog.Warn("per-org login budget exceeded; shedding", "org", orgID, "shed_total", total)
 	}
 }
 
