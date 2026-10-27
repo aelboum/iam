@@ -262,6 +262,15 @@ func (s *Service) resolveFederatedUser(ctx context.Context, idp *store.IDP, clai
 	if !idp.AutoCreateUsers {
 		return nil, ErrNoAccount
 	}
+	// Federated auto-provisioning must respect the per-org user quota, or a
+	// tenant's own IdP could create unbounded users and exhaust the shared
+	// database — the API create path enforces it, this path must too (internal
+	// security audit B3).
+	if n, err := s.store.Count(ctx, store.QuotaUsersPerOrg, idp.OrgID); err != nil {
+		return nil, err
+	} else if n >= store.MaxUsersPerOrg {
+		return nil, ErrNoAccount
+	}
 	if email == "" {
 		sum := sha256.Sum256([]byte(idp.ID + "\x00" + claims.Subject))
 		email = "idp-" + hex.EncodeToString(sum[:8]) + "@idp.invalid"

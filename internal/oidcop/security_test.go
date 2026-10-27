@@ -1,9 +1,12 @@
 package oidcop
 
 import (
+	"context"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"github.com/zitadel/oidc/v3/pkg/op"
 )
 
@@ -67,4 +70,44 @@ func TestRotatingCrypto(t *testing.T) {
 	if _, err := wrong.Decrypt(sealed); err == nil {
 		t.Fatal("decrypted with an unrelated key")
 	}
+}
+
+// TestAuthRequestParamCaps proves CreateAuthRequest rejects oversized free-form
+// parameters before storing them, so an unauthenticated /authorize caller
+// cannot inflate the database (internal security audit B2). A request carrying
+// a valid S256 challenge reaches the caps before any store access, so the test
+// needs no database.
+func TestAuthRequestParamCaps(t *testing.T) {
+	s := &Storage{}
+	big := strings.Repeat("x", 4096)
+	base := func() *oidc.AuthRequest {
+		return &oidc.AuthRequest{
+			ClientID:            "client",
+			CodeChallenge:       "a-challenge",
+			CodeChallengeMethod: oidc.CodeChallengeMethodS256,
+		}
+	}
+	cases := map[string]func(*oidc.AuthRequest){
+		"state":      func(r *oidc.AuthRequest) { r.State = big },
+		"nonce":      func(r *oidc.AuthRequest) { r.Nonce = big },
+		"login_hint": func(r *oidc.AuthRequest) { r.LoginHint = big },
+		"scope too long": func(r *oidc.AuthRequest) {
+			r.Scopes = []string{big}
+		},
+		"too many scopes": func(r *oidc.AuthRequest) {
+			r.Scopes = make([]string, 65)
+			for i := range r.Scopes {
+				r.Scopes[i] = "s"
+			}
+		},
+	}
+	for name, mut := range cases {
+		r := base()
+		mut(r)
+		if _, err := s.CreateAuthRequest(context.Background(), r, ""); err == nil {
+			t.Errorf("%s: oversized parameter accepted", name)
+		}
+	}
+	// A normal small request passes the caps (it then proceeds to the store,
+	// which this unit does not exercise).
 }

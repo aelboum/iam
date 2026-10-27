@@ -89,9 +89,9 @@ Authoritative status as of commit `1d48e51` (CI `test`/`e2e`/`security` green).
 | 9 | Live IdP flows + negative cases evidenced | **PASS** | WS5/WS7; Google + Entra over HTTPS staging |
 | 10 | Cross-tenant rejection verified | **PASS (with caveat)** | Live refusal at the authorize layer; engine strict-`iss` via offline tests (SECURITY.md) |
 | 11 | Secret/key/bootstrap-admin lifecycle reviewed | **PASS (follow-up)** | SECURITY.md; bootstrap-admin rotation is a documented production follow-up |
-| 12 | Independent external penetration test completed | **OPEN** | Package prepared (PENTEST.md); no engagement initiated — external authorization required |
+| 12 | Independent external penetration test completed | **NOT PERFORMED — INDEPENDENT TESTING NOT AVAILABLE** | No independent engagement initiated; internal and AI-assisted audits are explicitly **not** a substitute (PENTEST.md). External authorization required. |
 | 13 | Operational monitoring / IR / recovery documented | **PASS** | OPERATIONS.md, DEPLOYMENT.md (WS8) |
-| 14 | Every exception/residual risk explicit and reviewed | **PASS** | SECURITY.md residual register N1–N10 |
+| 14 | Every exception/residual risk explicit and reviewed | **PASS** | SECURITY.md residual register N1–N20 |
 | 15 | Final code, docs, migrations, config, CI agree | **PASS** | Reconciled; CI green on `1d48e51` |
 
 **Overall: `BLOCKED — EXTERNAL AUTHORIZATION REQUIRED`.** Every technical gate that can
@@ -101,3 +101,14 @@ operator authorization and an independent tester; until it is completed (with re
 retest) production stays **NO-GO**. Production hardening follow-ups (stable DNS instead of the
 ephemeral tunnel, a managed secret store, DB TLS, bootstrap-admin rotation) are to be applied
 at deploy time and do not block the pentest.
+
+An internal security audit (2026-10-27) — two independent reviews, every finding
+verified against the code — fixed four lower-severity issues (OIDC auth-request
+parameter caps, federated-provisioning quota, invalid-key log throttling, and
+canonical rate-limit/audit IP keys; see SECURITY.md) with regression tests, and
+dispositioned the rest (register N11–N20). These changes are validated locally
+(`go build`/`go vet`, `go test ./...` against a disposable Postgres, and the
+smoke + feature suites) but are **not yet committed**. This internal hardening
+does **not** satisfy criterion 12 and does **not** change the overall status:
+production remains **NO-GO** pending the independent external penetration test,
+its remediation, and retest.

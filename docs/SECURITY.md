@@ -90,6 +90,44 @@ High or Medium** defect. Three items were fixed and three dispositioned:
   `SafeIdPURL` is not re-run in `HandleCallback` (the dial guard and https-only
   transport still hold); and rate limits key on the full IPv6 address, not a /64.
 
+A fourth internal audit (2026-10-27) ran as two independent reviews — one
+implementation-first (route and enforcement map) and one attacker-first (abuse
+cases) — with every finding verified against the code and exercised by a test or
+the suites before being acted on. It found **no new Critical or High**, and no
+cross-tenant data access, authentication bypass, or privilege escalation. Four
+items were fixed with regression coverage; the rest were dispositioned (register
+rows N11–N20):
+
+- **Fixed — unauthenticated auth-request storage caps (Low, availability).**
+  `/authorize` stored `state`, `nonce`, `login_hint` and scopes with no length
+  bound (they live 30 minutes), so a valid `client_id` + `redirect_uri` could be
+  used to inflate the database. `CreateAuthRequest` now rejects over-long
+  parameters and excessive scopes (`oidcop/storage.go`). Regression:
+  `TestAuthRequestParamCaps`.
+- **Fixed — federated auto-provisioning ignored the per-org user quota (Low).**
+  The just-in-time create path bypassed the API-layer `QuotaUsersPerOrg` cap, so
+  a tenant's own IdP could create unbounded users. Both paths now share
+  `store.MaxUsersPerOrg` and the federation path enforces it before creating a
+  user (`authn/federation.go`, `store/page.go`, `api/api.go`).
+- **Fixed — invalid-API-key log flood (Informational).** The "invalid API key"
+  warning was logged before the per-address throttle, so a bad-key flood also
+  flooded the logs at line rate; it now logs only after the limiter admits the
+  caller (`api/api.go`).
+- **Fixed — non-canonical rate-limit / audit IP key (Informational).** A trusted
+  `X-End-User-IP` was used verbatim, so one address written several ways became
+  several limiter and audit keys; it is now reduced to its canonical form
+  (`api/api.go`). Regression: `TestClientIPCanonical`.
+- **Dispositioned** (register N11–N20): the temporary lockout is account-wide by
+  design — a per-factor split was prototyped and **reverted** because it weakened
+  the tested rule that a TOTP lockout must also block the password and reset
+  steps; a shared argon2 hashing pool is a noisy-neighbour availability risk;
+  federated auto-provisioning stores an untrusted IdP email as the identity;
+  authorization-code reuse does not revoke already-issued tokens; a
+  client-credentials timing distinguisher; an org-admin key may revoke its
+  sibling and parent keys; authorization codes are stored unhashed; minor
+  metadata and audit-logging gaps; and an existing project grant's role set is
+  adjustable by the project owner.
+
 ## Residual-risk register
 
 | ID | Risk | Severity | Impact | Compensating control | Disposition / owner |
@@ -105,6 +143,16 @@ High or Medium** defect. Three items were fixed and three dispositioned:
 | N8 | TOTP failure counter (`mfa_failed_logins`) does not decay and is not cleared by a password success | Low | After a few bad TOTP guesses a later legitimate typo can trigger a 15-minute lockout | The sticky counter is an intentional TOTP brute-force bound; clearing it on password success would let a password holder reset the TOTP guess budget | **Accepted (intended).** Owner: maintainer. |
 | N9 | `SafeIdPURL` is not re-checked in `HandleCallback` (endpoints are re-read from discovery) | Informational | A generic-OIDC org admin could aim a blind token-endpoint POST at any public https URL | The dial guard (`PublicAddress`), https-only transport, and body caps hold on every hop and redirect | **Accepted.** Owner: maintainer. |
 | N10 | Rate limits key on the full IPv6 address, not a /64 | Low | A /64 holder can rotate addresses to evade IP-based limits | Per-account lockout and 256-bit secrets hold; `X-End-User-IP` is trusted only from login-API keys; `/idp/callback` needs a valid state | **Accepted (known).** Owner: maintainer. |
+| N11 | The temporary failed-login lockout is account-wide; a password-guess lockout also delays a SSO/passkey user's mandatory TOTP second factor | Low (availability) | A known login name can be locked for ~15-min windows, delaying its TOTP step; SSO/passkey *admission* is already exempt | Lockout is temporary and bounded; manual unlock clears it | **Accepted (intended).** A per-factor split was prototyped and reverted because it weakened the tested anti-bypass that a TOTP lockout must also block the password/reset step; any change is an owner decision. Owner: maintainer. |
+| N12 | The shared argon2 hashing pool can be saturated by one tenant (noisy neighbour) | Medium (availability) | Login latency degrades for all tenants under a crafted flood of hash operations | Per-key login (1200/min), per-IP, and per-key management limits bound the rate; non-GET work is time-bounded by server timeouts | **Accepted (known).** The mitigation (context-aware, bounded slot acquisition) needs load testing, which is not permitted on shared staging. Owner: maintainer. |
+| N13 | Federated auto-provisioning stores an untrusted IdP email as the account identity | Low | Same-org account squat, or a persistent SSO link to an account a victim may later adopt | Requires `auto_create_users` (off by default); identity keyed on `(idp_id, sub)`; email linking needs instance `trust_email` | **Accepted (documented).** Recommended mitigation — store a synthetic placeholder email unless `trust_email`-verified — changes provisioning behaviour. Owner: maintainer. |
+| N14 | A reused authorization code's already-issued tokens are not revoked (RFC 6749 §4.1.2 SHOULD) | Low | An intercepted-then-first-exchanged code is not retroactively detected | Code is single-use; PKCE and client authentication gate the exchange | **Accepted.** Owner: maintainer. |
+| N15 | Client-credentials timing distinguishes an existing machine `client_id` from an absent one | Informational | Confirms a client_id exists; guessing is infeasible (128-bit IDs) | 128-bit client IDs; per-IP limit | **Accepted.** Owner: maintainer. |
+| N16 | A compromised org-admin key can revoke its sibling and parent org keys (cascade) | Low | Denial of service on the org's own management plane; no cross-tenant effect | Keys reach only their own org; the instance admin re-issues; a key cannot delete itself | **Accepted (by design).** Owner: operator. |
+| N17 | Authorization codes are stored as the op-crypto ciphertext, not hashed | Informational | A database/backup reader could redeem a still-live (≤5-min) code | PKCE / client secret still gate redemption; 5-minute TTL | **Accepted.** Hash-at-rest is a possible hardening. Owner: maintainer. |
+| N18 | A granted org can read the project's `owner_org_id` | Informational | Minor cross-tenant metadata exposure | The grant is an intentional relationship between the two orgs | **Accepted.** Owner: maintainer. |
+| N19 | Refused cross-tenant attempts are not separately audited; a trust-policy change does not end already-issued federated sessions | Informational | Reduced forensic signal; a trust downgrade applies only to new sessions (≤15-min TTL) | Refusals return 403/404; sessions are short-lived | **Accepted.** Owner: maintainer. |
+| N20 | `updateProjectGrant` / `deleteProjectGrant` (owner path) require only the project owner, while `createProjectGrant` requires an instance admin | Low (decision) | A vendor org can adjust the role set of an existing grant to its own project without instance-admin review | Roles are the owner's own project roles; no cross-tenant data; granting a project to another org still needs an instance admin | **Open (owner decision)** — intentional owner self-service, or gate update like create. Owner: maintainer. |
 
 Review this register whenever dependencies, migrations, or the trust model change.
 

@@ -75,6 +75,21 @@ func (s *Storage) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest, 
 			return nil, oidc.ErrInvalidRequest().WithDescription("PKCE (code_challenge, S256) is required for this client")
 		}
 	}
+	// Bound the free-form parameters an unauthenticated caller can get stored
+	// via /authorize (they live 30 minutes), so a client_id + redirect_uri
+	// cannot be used to inflate the database (internal security audit B2).
+	const maxParam = 2048
+	if len(req.State) > maxParam || len(req.Nonce) > maxParam || len(req.LoginHint) > maxParam {
+		return nil, oidc.ErrInvalidRequest().WithDescription("request parameter too long")
+	}
+	if len(req.Scopes) > 64 {
+		return nil, oidc.ErrInvalidRequest().WithDescription("too many scopes")
+	}
+	for _, sc := range req.Scopes {
+		if len(sc) > maxParam {
+			return nil, oidc.ErrInvalidRequest().WithDescription("scope too long")
+		}
+	}
 	r := &store.AuthRequest{
 		ID:                  uuid.NewString(),
 		ClientID:            req.ClientID,

@@ -190,11 +190,14 @@ func (s *Server) requireAPIKey(next http.Handler) http.Handler {
 			// Only invalid keys are throttled, so a flood of bad keys from a
 			// shared address (e.g. a NAT) can never lock out a valid key.
 			peer := clientIP(r) // the connection address: no key, so no trusted header
-			slog.WarnContext(r.Context(), "invalid API key", "ip", peer, "path", r.URL.Path)
+			// Rate-limit before logging, so a flood of invalid keys from one
+			// address cannot also flood the logs at line rate (internal security
+			// audit B9).
 			if !s.authFailLimit.Allow(peer) {
 				fail(w, r, authn.ErrRateLimited)
 				return
 			}
+			slog.WarnContext(r.Context(), "invalid API key", "ip", peer, "path", r.URL.Path)
 			writeError(w, http.StatusUnauthorized, "invalid or expired API key")
 			return
 		}
@@ -250,8 +253,10 @@ type endUserIPKey struct{}
 // management API and its audit trail) only the connection's address counts.
 func clientIP(r *http.Request) string {
 	if trusted, _ := r.Context().Value(endUserIPKey{}).(bool); trusted {
-		if v := strings.TrimSpace(r.Header.Get(endUserIPHeader)); net.ParseIP(v) != nil {
-			return v
+		if ip := net.ParseIP(strings.TrimSpace(r.Header.Get(endUserIPHeader))); ip != nil {
+			// Canonical form, so one address is one limiter and audit key and
+			// cannot be varied by spelling (internal security audit B10).
+			return ip.String()
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -401,7 +406,7 @@ func validList(field string, items []string) error {
 // quotaLimits bound how much one tenant can create, so no org can exhaust
 // the shared database.
 var quotaLimits = map[store.Quota]int{
-	store.QuotaUsersPerOrg:     100_000,
+	store.QuotaUsersPerOrg:     store.MaxUsersPerOrg,
 	store.QuotaProjectsPerOrg:  100,
 	store.QuotaKeysPerOrg:      50,
 	store.QuotaAppsPerProject:  50,

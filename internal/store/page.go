@@ -124,6 +124,12 @@ type Quota struct {
 	column string
 }
 
+// MaxUsersPerOrg bounds how many users one org may hold, so no tenant can
+// exhaust the shared database. It is the single source of truth for both the
+// API quota check and the federated auto-provisioning guard (internal security
+// audit B3).
+const MaxUsersPerOrg = 100_000
+
 var (
 	QuotaUsersPerOrg     = Quota{"users per org", "users", "org_id"}
 	QuotaProjectsPerOrg  = Quota{"projects per org", "projects", "owner_org_id"}
