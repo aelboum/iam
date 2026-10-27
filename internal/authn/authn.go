@@ -7,11 +7,12 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
-	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -23,6 +24,7 @@ import (
 
 	"github.com/aelboum/iam/internal/ratelimit"
 	"github.com/aelboum/iam/internal/secret"
+	"github.com/aelboum/iam/internal/sizing"
 	"github.com/aelboum/iam/internal/store"
 )
 
@@ -30,11 +32,20 @@ var (
 	// ErrInvalidCredentials is deliberately vague to avoid user enumeration.
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrLocked             = errors.New("user is locked")
-	ErrRateLimited        = errors.New("too many attempts, try again later")
-	ErrSessionInvalid     = errors.New("session invalid or expired")
-	ErrNotAuthenticated   = errors.New("session is not fully authenticated")
-	ErrNoAccess           = errors.New("user's org has no access to this application")
-	ErrTOTPNotEnrolled    = errors.New("totp not enrolled")
+	// ErrRateLimited is a caller- or tenant-attributable limit: a hard IP/key/
+	// account limiter or the per-org password-login budget (A4). It maps to HTTP
+	// 429 with a window-length Retry-After.
+	ErrRateLimited = errors.New("too many attempts, try again later")
+	// ErrOverloaded is a transient, server-side shed: all argon2 hashing slots
+	// were busy past HashWaitTimeout. It is not caller-specific and clears in
+	// sub-second to a few seconds, so it maps to HTTP 503 with a short Retry-After,
+	// distinct from the caller-attributable ErrRateLimited (internal security
+	// audit N12/R4). On the OIDC token endpoint it surfaces as server_error.
+	ErrOverloaded       = errors.New("authentication temporarily overloaded")
+	ErrSessionInvalid   = errors.New("session invalid or expired")
+	ErrNotAuthenticated = errors.New("session is not fully authenticated")
+	ErrNoAccess         = errors.New("user's org has no access to this application")
+	ErrTOTPNotEnrolled  = errors.New("totp not enrolled")
 )
 
 // WeakPasswordError explains why a password was rejected.
@@ -67,6 +78,12 @@ type Config struct {
 	// Limits builds the rate limiters (in-memory or shared).
 	Limits          ratelimit.Factory
 	LockoutDuration time.Duration
+	// HashWaitTimeout bounds how long a request waits for a password-hashing
+	// slot before it is shed as ErrOverloaded (internal security audit N12).
+	HashWaitTimeout time.Duration
+	// OrgLoginLimit is the per-organization password-login budget (attempts per
+	// minute, aggregated across the org's keys/accounts/IPs) (audit N12/A4).
+	OrgLoginLimit int
 }
 
 type Service struct {
@@ -76,6 +93,9 @@ type Service struct {
 	cfg       Config
 	// accountLimit caps password/TOTP attempts per user, whatever the source IP.
 	accountLimit ratelimit.Allower
+	// orgLogin caps password-login (argon2) attempts per org, aggregated across
+	// all of the org's keys, accounts and IPs (internal security audit N12/A4).
+	orgLogin ratelimit.Allower
 	// dummyHash is verified for unknown users so response time does not reveal them.
 	dummyHash string
 	// httpClient talks to external identity providers (SSRF-guarded).
@@ -95,8 +115,10 @@ func NewService(st *store.Store, box *secret.Box, cfg Config) *Service {
 		),
 		cfg:          cfg,
 		accountLimit: cfg.Limits("login-account", 10, 10),
-		httpClient:   NewOutboundClient(cfg.DevMode),
-		webauthn:     cfg.WebAuthn,
+		// Burst a quarter of the per-minute budget, mirroring the login-key limiter.
+		orgLogin:   cfg.Limits("login-org", float64(cfg.OrgLoginLimit), max(1, cfg.OrgLoginLimit/4)),
+		httpClient: NewOutboundClient(cfg.DevMode),
+		webauthn:   cfg.WebAuthn,
 	}
 	hash, err := s.passwords.Hash(secret.Token(16))
 	if err != nil {
@@ -140,10 +162,20 @@ func (s *Service) HashSecret(v string) (string, error) {
 	return s.hash(v)
 }
 
-// VerifySecret checks a client secret against its hash.
-func (s *Service) VerifySecret(hash, v string) bool {
-	_, err := s.verify(hash, v)
-	return err == nil
+// VerifySecret checks a client secret against its hash. It returns (true, nil)
+// on a match, (false, nil) for a genuine mismatch, and (false, err) for an
+// overload (ErrOverloaded) or other error, so a hashing-overload shed is never
+// reported as an invalid secret. It never returns (true, err) (internal security
+// audit N12/R1). Callers must fail closed on a non-nil error (never grant) and
+// should surface it as a transient/overload response, not invalid_client.
+func (s *Service) VerifySecret(hash, v string) (bool, error) {
+	if _, err := s.verify(hash, v); err != nil {
+		if errors.Is(err, passwap.ErrPasswordMismatch) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Service) SetPassword(ctx context.Context, user *store.User, password string) error {
@@ -420,6 +452,15 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 	if !s.accountLimit.Allow(attemptKey(sess)) {
 		return nil, ErrRateLimited
 	}
+	// Per-org aggregate cap on password-login hashing, so one tenant cannot
+	// monopolize the shared argon2 slots across many keys, accounts or IPs
+	// (internal security audit N12/A4). Keyed on the server-resolved org id;
+	// checked once per attempt, before any lockout counter or hashing, so a
+	// shed attempt neither counts toward lockout nor spends a hash slot.
+	if !s.orgLogin.Allow(sess.OrgID) {
+		logOrgLoginLimited(sess.OrgID)
+		return nil, ErrRateLimited
+	}
 	// Reserve the attempt before verifying, so parallel guesses cannot exceed
 	// the lockout threshold. Unknown and locked users take the same path and
 	// time, and get the same answer as a wrong password; a locked account's
@@ -434,7 +475,16 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 		}
 	}
 	if !reserved || !user.HasPassword() || utf8.RuneCountInString(password) > maxPasswordLength {
-		s.verifyDummy(password)
+		// If hashing was shed under overload, the dummy check could not run, so
+		// surface overload rather than invalid credentials — otherwise a known
+		// user (503) and an unknown or locked one (401) would differ under load,
+		// leaking which accounts exist (internal security audit N12).
+		if errors.Is(s.verifyDummy(password), ErrOverloaded) {
+			if reserved {
+				s.releaseAttempt(ctx, user.ID)
+			}
+			return nil, ErrOverloaded
+		}
 		if reserved {
 			return nil, s.attemptFailed(ctx, c, user, store.FactorPassword)
 		}
@@ -445,10 +495,15 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 	}
 	updated, verr := s.verify(*user.PasswordHash, password)
 	if verr != nil {
-		if !errors.Is(verr, passwap.ErrPasswordMismatch) {
-			return nil, verr
+		if errors.Is(verr, passwap.ErrPasswordMismatch) {
+			return nil, s.attemptFailed(ctx, c, user, store.FactorPassword)
 		}
-		return nil, s.attemptFailed(ctx, c, user, store.FactorPassword)
+		// A non-mismatch error (hash overload shed, or an internal hashing error)
+		// means the password was never evaluated. Release the reserved attempt so
+		// a transient shed does not count as a failure and push a real user toward
+		// lockout, then surface the error (internal security audit N12).
+		s.releaseAttempt(ctx, user.ID)
+		return nil, verr
 	}
 	if updated != "" {
 		// Upgrade the hash only if it was not changed meanwhile (e.g. an admin reset).
@@ -525,27 +580,116 @@ func (s *Service) attemptFailed(ctx context.Context, c Client, user *store.User,
 	return ErrInvalidCredentials
 }
 
-// hashSlots bounds concurrent password hashing. Each argon2id run uses about
-// 64 MiB, so unbounded parallel requests could exhaust memory.
-var hashSlots = make(chan struct{}, max(2, runtime.NumCPU()))
+// hashSlots bounds concurrent password hashing across the whole process. Each
+// argon2id run uses about 64 MiB, so unbounded parallel requests could exhaust
+// memory. It defaults to a container-aware slot count (GOMAXPROCS, floored at 2)
+// and can be resized once at startup by ConfigureHashSlots.
+var hashSlots = make(chan struct{}, sizing.AutoHashSlots())
+
+// ConfigureHashSlots sets the size of the process-wide hashing pool. It replaces
+// the semaphore, so it must be called once at startup before the engine begins
+// serving — the goroutine-creation that starts the HTTP server establishes the
+// happens-before that makes the new value visible to request handlers. It must
+// not be called while hashes are in flight: acquireHashSlot captures the channel
+// at call time, so replacing it mid-flight would strand slots on the old pool. A
+// count below 2 is floored at 2 so the pool is never degenerate.
+func ConfigureHashSlots(slots int) {
+	hashSlots = make(chan struct{}, max(2, slots))
+}
+
+// acquireHashSlot waits up to HashWaitTimeout for a hashing slot. If none frees
+// in time it sheds the request as ErrOverloaded (mapped to HTTP 503) instead of
+// queueing without bound, so one tenant cannot grow an unbounded hashing backlog
+// for everyone else (internal security audit N12). The shed is a transient
+// server condition, not a caller-attributable limit, so it is distinct from
+// ErrRateLimited (N12/R4). It returns a release closure only when a slot was
+// actually acquired, so a timed-out acquire leaks nothing.
+func (s *Service) acquireHashSlot() (func(), error) {
+	// Capture the channel so the release targets the same pool this acquire used,
+	// even if ConfigureHashSlots were to replace the global meanwhile.
+	ch := hashSlots
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-time.After(s.cfg.HashWaitTimeout):
+		logHashShed(s.cfg.HashWaitTimeout)
+		return nil, ErrOverloaded
+	}
+}
+
+// hash-shed observability: count every shed but log at most once per second with
+// the running total, so the warning cannot flood the logs under the very overload
+// it reports (internal security audit N12/R3). No password, hash, key or token.
+var (
+	hashShedTotal atomic.Int64
+	hashShedLogAt atomic.Int64 // unix-nanos of the last emitted warning
+)
+
+func logHashShed(wait time.Duration) {
+	total := hashShedTotal.Add(1)
+	now := time.Now().UnixNano()
+	last := hashShedLogAt.Load()
+	if now-last >= int64(time.Second) && hashShedLogAt.CompareAndSwap(last, now) {
+		slog.Warn("password hashing overloaded; shedding requests", "shed_total", total, "wait", wait.String())
+	}
+}
+
+// per-org login-budget observability: count every denial but log at most once
+// per second with the running total, so it cannot flood the logs. The org id is
+// an identifier, not a secret; no password/token is logged (audit N12/A4/R3).
+var (
+	orgLimitTotal atomic.Int64
+	orgLimitLogAt atomic.Int64
+)
+
+func logOrgLoginLimited(orgID string) {
+	total := orgLimitTotal.Add(1)
+	now := time.Now().UnixNano()
+	last := orgLimitLogAt.Load()
+	if now-last >= int64(time.Second) && orgLimitLogAt.CompareAndSwap(last, now) {
+		slog.Warn("per-org login budget exceeded; shedding", "org", orgID, "shed_total", total)
+	}
+}
 
 func (s *Service) verify(hash, password string) (string, error) {
-	hashSlots <- struct{}{}
-	defer func() { <-hashSlots }()
+	release, err := s.acquireHashSlot()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	return s.passwords.Verify(hash, password)
 }
 
-// verifyDummy spends the time of a real check, for unknown or locked users.
-func (s *Service) verifyDummy(password string) {
+// verifyDummy spends the time of a real check, for unknown or locked users, so
+// response time does not reveal them. It returns ErrOverloaded when hashing was
+// shed, so the caller can report overload uniformly instead of as invalid
+// credentials (internal security audit N12); a mismatch against the dummy hash
+// is expected and reported as nil.
+func (s *Service) verifyDummy(password string) error {
 	if len(password) > maxPasswordLength*4 {
 		password = password[:maxPasswordLength*4]
 	}
-	_, _ = s.verify(s.dummyHash, password)
+	if _, err := s.verify(s.dummyHash, password); errors.Is(err, ErrOverloaded) {
+		return ErrOverloaded
+	}
+	return nil
+}
+
+// releaseAttempt best-effort undoes a reserved login attempt that was never
+// evaluated because hashing was shed. A failure here must not mask the error
+// already being returned to the caller, so it is only logged.
+func (s *Service) releaseAttempt(ctx context.Context, userID string) {
+	if err := s.store.ReleaseAttempt(ctx, userID, store.FactorPassword); err != nil {
+		slog.Warn("could not release an unevaluated login attempt", "error", err)
+	}
 }
 
 func (s *Service) hash(password string) (string, error) {
-	hashSlots <- struct{}{}
-	defer func() { <-hashSlots }()
+	release, err := s.acquireHashSlot()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	return s.passwords.Hash(password)
 }
 

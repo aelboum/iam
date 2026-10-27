@@ -390,14 +390,25 @@ func (s *Storage) GetClientByClientID(ctx context.Context, clientID string) (op.
 // which only knows apps, and introspection only answers apps.
 func (s *Storage) AuthorizeClientIDSecret(ctx context.Context, clientID, clientSecret string) error {
 	if app, err := s.store.GetAppByClientID(ctx, clientID); err == nil {
-		if app.ClientSecretHash != nil && s.authn.VerifySecret(*app.ClientSecretHash, clientSecret) {
-			return nil
+		if app.ClientSecretHash != nil {
+			ok, verr := s.authn.VerifySecret(*app.ClientSecretHash, clientSecret)
+			if verr != nil { // overload etc.: do not claim the secret is invalid
+				return oidc.ErrServerError().WithDescription("authentication temporarily unavailable")
+			}
+			if ok {
+				return nil
+			}
 		}
 		return oidc.ErrInvalidClient().WithDescription("invalid client credentials")
 	}
-	if m, err := s.store.GetMachineUserByClientID(ctx, clientID); err == nil && !m.Locked &&
-		m.ClientSecretHash != nil && s.authn.VerifySecret(*m.ClientSecretHash, clientSecret) {
-		return nil
+	if m, err := s.store.GetMachineUserByClientID(ctx, clientID); err == nil && !m.Locked && m.ClientSecretHash != nil {
+		ok, verr := s.authn.VerifySecret(*m.ClientSecretHash, clientSecret)
+		if verr != nil {
+			return oidc.ErrServerError().WithDescription("authentication temporarily unavailable")
+		}
+		if ok {
+			return nil
+		}
 	}
 	return oidc.ErrInvalidClient().WithDescription("invalid client credentials")
 }
@@ -577,7 +588,14 @@ var _ op.ClientCredentialsStorage = (*Storage)(nil)
 // ClientCredentials authenticates a machine user by client id and secret.
 func (s *Storage) ClientCredentials(ctx context.Context, clientID, clientSecret string) (op.Client, error) {
 	user, err := s.store.GetMachineUserByClientID(ctx, clientID)
-	if err != nil || user.ClientSecretHash == nil || !s.authn.VerifySecret(*user.ClientSecretHash, clientSecret) {
+	if err != nil || user.ClientSecretHash == nil {
+		return nil, oidc.ErrInvalidClient().WithDescription("invalid client credentials")
+	}
+	ok, verr := s.authn.VerifySecret(*user.ClientSecretHash, clientSecret)
+	if verr != nil { // overload etc.: do not claim the secret is invalid
+		return nil, oidc.ErrServerError().WithDescription("authentication temporarily unavailable")
+	}
+	if !ok {
 		return nil, oidc.ErrInvalidClient().WithDescription("invalid client credentials")
 	}
 	if user.Locked {

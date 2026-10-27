@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"sort"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -47,10 +48,51 @@ func OpenLimited(ctx context.Context, url string, maxConns int32) (*pgxpool.Pool
 	return pool, nil
 }
 
+// migrateAdvisoryLockKey is a fixed, arbitrary key identifying the schema
+// migration critical section. Every caller uses the same key, so Postgres
+// serializes them cluster-wide.
+const migrateAdvisoryLockKey int64 = 0x49414D5F4D4947 // "IAM_MIG"
+
 // Migrate applies every migration file not yet recorded in schema_migrations,
 // in lexical order, each inside its own transaction.
+//
+// The whole run is serialized by a session-level Postgres advisory lock held on
+// a dedicated connection. Without it, concurrent callers — every replica of a
+// scaled deployment starting at once, or parallel `go test` packages sharing one
+// database — collide: catalog DDL (including CREATE TABLE IF NOT EXISTS) is not
+// concurrency-safe and raises duplicate-key errors, and two callers can both see
+// a migration as unapplied and then both insert its schema_migrations row. Later
+// callers block on the lock, and by the time they acquire it every migration is
+// already recorded, so they do nothing.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	// Release the lock before the connection returns to the pool. A session-level
+	// advisory lock outlives the pool checkout, so an un-released connection would
+	// keep the lock and deadlock every later migrator. Use a fresh context so the
+	// unlock still runs if ctx was cancelled. If the unlock itself fails on a still-
+	// live connection, destroy that connection instead of returning it to the pool,
+	// so the session — and with it the lock — ends.
+	locked := false
+	defer func() {
+		if locked {
+			if _, uerr := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrateAdvisoryLockKey); uerr != nil {
+				slog.Warn("migration advisory unlock failed; discarding connection", "error", uerr)
+				conn.Hijack().Close(context.Background())
+				return
+			}
+		}
+		conn.Release()
+	}()
+
+	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrateAdvisoryLockKey); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	locked = true
+
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version text PRIMARY KEY,
 		applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
@@ -64,7 +106,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 
 	for _, file := range files {
 		var applied bool
-		if err := pool.QueryRow(ctx,
+		if err := conn.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, file,
 		).Scan(&applied); err != nil {
 			return err
@@ -76,7 +118,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return err
 		}
-		tx, err := pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return err
 		}

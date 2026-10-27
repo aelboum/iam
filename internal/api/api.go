@@ -362,6 +362,12 @@ func fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, authn.ErrRateLimited):
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, err.Error())
+	case errors.Is(err, authn.ErrOverloaded):
+		// Transient, server-side hashing shed (A1): 503 with a short Retry-After,
+		// not the 429 window used for caller/tenant limits (internal security
+		// audit N12/R4). The hint is advisory, never a capacity guarantee.
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusServiceUnavailable, err.Error())
 	default:
 		slog.ErrorContext(r.Context(), "request failed", "method", r.Method, "path", r.URL.Path, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aelboum/iam/internal/sizing"
 )
 
 type Config struct {
@@ -48,6 +50,24 @@ type Config struct {
 	MaxFailedLogins     int
 	LockoutDuration     time.Duration
 	AuditRetention      time.Duration
+	// HashWaitTimeout bounds how long a request waits for a password-hashing
+	// slot before it is shed as rate-limited, so one tenant cannot grow an
+	// unbounded hashing backlog for everyone else (internal security audit N12).
+	HashWaitTimeout time.Duration
+	// OrgLoginLimit caps password-login (argon2) attempts per organization per
+	// minute, aggregated across all of that org's keys, accounts and IPs, so one
+	// tenant cannot monopolize the shared hashing capacity (internal security
+	// audit N12/A4).
+	OrgLoginLimit int
+	// HashSlots is the number of concurrent argon2id password hashes allowed
+	// across the process. 0 means auto-size from GOMAXPROCS (container-aware).
+	// Each slot can hold ~64 MiB resident while hashing (internal security audit
+	// N12).
+	HashSlots int
+	// StrictSizing makes an insufficient-memory sizing check fatal at startup
+	// instead of a warning, so a misconfigured deployment fails fast rather than
+	// risking OOM under load.
+	StrictSizing bool
 
 	// Passkeys: the relying party ID (a domain) and the login UI origins.
 	WebAuthnRPID    string
@@ -96,6 +116,7 @@ func Load() (*Config, error) {
 		{&cfg.KeyRotationInterval, "IAM_KEY_ROTATION", 30 * 24 * time.Hour},
 		{&cfg.LockoutDuration, "IAM_LOCKOUT_DURATION", 15 * time.Minute},
 		{&cfg.AuditRetention, "IAM_AUDIT_RETENTION", 365 * 24 * time.Hour},
+		{&cfg.HashWaitTimeout, "IAM_HASH_WAIT_TIMEOUT", 3 * time.Second},
 	}
 	for _, d := range durations {
 		v, err := time.ParseDuration(env(d.name, d.fallback.String()))
@@ -104,6 +125,21 @@ func Load() (*Config, error) {
 		}
 		*d.dst = v
 	}
+	orgLimit, err := strconv.Atoi(env("IAM_ORG_LOGIN_LIMIT", "1200"))
+	if err != nil || orgLimit <= 0 {
+		return nil, errors.New("IAM_ORG_LOGIN_LIMIT must be a positive integer (password logins per org per minute)")
+	}
+	cfg.OrgLoginLimit = orgLimit
+
+	// IAM_HASH_SLOTS: 0 (or unset) means auto-size from GOMAXPROCS at startup.
+	// A positive count overrides it, bounded so a typo cannot request a pool whose
+	// peak hashing memory is absurd.
+	slots, err := strconv.Atoi(env("IAM_HASH_SLOTS", "0"))
+	if err != nil || slots < 0 || slots > sizing.MaxHashSlots {
+		return nil, fmt.Errorf("IAM_HASH_SLOTS must be an integer between 0 (auto) and %d", sizing.MaxHashSlots)
+	}
+	cfg.HashSlots = slots
+	cfg.StrictSizing = os.Getenv("IAM_STRICT_SIZING") == "true"
 	if cfg.Issuer == "" {
 		return nil, errors.New("IAM_ISSUER is required")
 	}
