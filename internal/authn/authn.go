@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -144,10 +145,20 @@ func (s *Service) HashSecret(v string) (string, error) {
 	return s.hash(v)
 }
 
-// VerifySecret checks a client secret against its hash.
-func (s *Service) VerifySecret(hash, v string) bool {
-	_, err := s.verify(hash, v)
-	return err == nil
+// VerifySecret checks a client secret against its hash. It returns (true, nil)
+// on a match, (false, nil) for a genuine mismatch, and (false, err) for an
+// overload (ErrRateLimited) or other error, so a hashing-overload shed is never
+// reported as an invalid secret. It never returns (true, err) (internal security
+// audit N12/R1). Callers must fail closed on a non-nil error (never grant) and
+// should surface it as a transient/overload response, not invalid_client.
+func (s *Service) VerifySecret(hash, v string) (bool, error) {
+	if _, err := s.verify(hash, v); err != nil {
+		if errors.Is(err, passwap.ErrPasswordMismatch) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Service) SetPassword(ctx context.Context, user *store.User, password string) error {
@@ -543,9 +554,25 @@ func (s *Service) acquireHashSlot() (func(), error) {
 	case hashSlots <- struct{}{}:
 		return func() { <-hashSlots }, nil
 	case <-time.After(s.cfg.HashWaitTimeout):
-		// Observability only: a bounded signal with no password, hash, key or token.
-		slog.Warn("password hashing overloaded; shedding request", "wait", s.cfg.HashWaitTimeout.String())
+		logHashShed(s.cfg.HashWaitTimeout)
 		return nil, ErrRateLimited
+	}
+}
+
+// hash-shed observability: count every shed but log at most once per second with
+// the running total, so the warning cannot flood the logs under the very overload
+// it reports (internal security audit N12/R3). No password, hash, key or token.
+var (
+	hashShedTotal atomic.Int64
+	hashShedLogAt atomic.Int64 // unix-nanos of the last emitted warning
+)
+
+func logHashShed(wait time.Duration) {
+	total := hashShedTotal.Add(1)
+	now := time.Now().UnixNano()
+	last := hashShedLogAt.Load()
+	if now-last >= int64(time.Second) && hashShedLogAt.CompareAndSwap(last, now) {
+		slog.Warn("password hashing overloaded; shedding requests", "shed_total", total, "wait", wait.String())
 	}
 }
 
