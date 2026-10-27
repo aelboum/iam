@@ -35,6 +35,10 @@ Optional (default in parentheses, from `config.go`):
 - TTLs: `IAM_ACCESS_TOKEN_TTL` (`5m`), `IAM_REFRESH_IDLE_TTL` (`168h`),
   `IAM_SESSION_MAX_AGE` (`720h`), `IAM_LOGIN_TTL` (`15m`), `IAM_KEY_ROTATION`
   (`720h`), `IAM_LOCKOUT_DURATION` (`15m`), `IAM_AUDIT_RETENTION` (`8760h`).
+- Password-hashing capacity (see "Capacity and overload" below):
+  `IAM_HASH_SLOTS` (`0` = auto-size from GOMAXPROCS), `IAM_STRICT_SIZING`
+  (`false`), `IAM_HASH_WAIT_TIMEOUT` (`3s`), `IAM_ORG_LOGIN_LIMIT` (`1200`
+  password logins per org per minute).
 - Passkeys: `IAM_WEBAUTHN_RP_ID` (defaults to the issuer host),
   `IAM_WEBAUTHN_ORIGINS` (defaults to the issuer origin) — set both to the login
   UI's real domain and origin(s); invalid values fail fast at boot.
@@ -69,6 +73,43 @@ Lockout threshold is 5 failed attempts (`MaxFailedLogins`, per factor).
 - Per-tenant quotas (enforced in code): 100k users, 100 projects, 50 API keys per
   org; 50 apps and 200 roles per project. List endpoints paginate (`?limit=` max
   1000, `?offset=`).
+- Schema migrations run automatically at startup under a Postgres advisory lock,
+  so several instances starting at once (a rolling deploy) migrate safely: one
+  applies pending migrations while the others wait, then find nothing to do.
+
+## Capacity and overload (password hashing)
+
+Password verification and password setting run argon2id, which is deliberately
+expensive: at the engine's parameters each in-flight hash holds about **64 MiB**
+resident and uses a full CPU core for tens of milliseconds. The engine bounds how
+many run at once with a process-wide pool of *hash slots*; requests that cannot
+get a slot within `IAM_HASH_WAIT_TIMEOUT` are shed with HTTP 503 (distinct from a
+429 rate-limit) rather than queued without bound.
+
+- **Slot count.** `IAM_HASH_SLOTS` sets the pool size. `0` (the default)
+  auto-sizes to `GOMAXPROCS`, floored at 2. `GOMAXPROCS` honours a cgroup CPU
+  quota on Go 1.25+, so inside a CPU-limited container the pool already scales to
+  the quota, not to the host's physical cores. Set an explicit value only to
+  override that.
+- **Memory estimate.** Peak hashing memory ≈ `slots × 64 MiB`, plus ~128 MiB
+  base for the runtime, DB pool and buffers. Example: 8 slots ≈ 512 MiB hashing +
+  128 MiB ≈ **640 MiB**. Give the container a memory limit above that, or lower
+  `IAM_HASH_SLOTS`.
+- **Memory check.** At startup the engine reads the cgroup memory limit (v2
+  `memory.max`, then v1 `memory.limit_in_bytes`). If that limit is **known and
+  finite** and cannot hold the estimate, it logs a warning. With
+  `IAM_STRICT_SIZING=true` the mismatch is fatal (fail fast rather than risk OOM
+  under load). **Limitation:** the check is skipped silently when no cgroup memory
+  limit is readable — non-Linux hosts, no cgroup memory controller, or an
+  unlimited (`max`) setting. It never invents a limit, so it cannot protect a
+  host with no enforced memory limit; set `IAM_HASH_SLOTS` by hand there.
+- **Per-org budget.** `IAM_ORG_LOGIN_LIMIT` (default 1200/min) caps password
+  logins per organization across all of that org's keys, accounts and IPs, so one
+  tenant cannot monopolize the shared hashing pool.
+- **Tuning.** Start with the auto default. If you see sustained 503s on login
+  endpoints under legitimate load, raise `IAM_HASH_SLOTS` *and* the memory limit
+  together, or scale out horizontally. Watch the `shed_total` fields in the
+  "overloaded" / "per-org login budget" warning logs (see monitoring below).
 
 ## Health and readiness
 

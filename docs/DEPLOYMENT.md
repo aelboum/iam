@@ -152,8 +152,12 @@ The engine applies migrations automatically at startup: `Migrate` in
 [internal/db/db.go](../internal/db/db.go) runs every file under
 `internal/db/migrations/*.sql` not yet recorded in the `schema_migrations`
 table, in lexical order, **each inside its own transaction that also records the
-version**. There is **no automatic down-migration mechanism** in this
-repository; migrations only move forward.
+version**. The whole run is serialized by a session-level Postgres advisory
+lock, so when several instances start at once (a rolling deploy) exactly one
+applies the pending migrations while the others block, then find everything
+recorded and apply nothing — concurrent startup cannot corrupt the schema or
+double-apply a migration. There is **no automatic down-migration mechanism** in
+this repository; migrations only move forward.
 
 If a migration fails during an upgrade:
 
