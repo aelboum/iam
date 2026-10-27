@@ -23,9 +23,12 @@ type User struct {
 	FailedLogins  int     `json:"-"`
 	// Locked is a manual lock set by an administrator.
 	Locked bool `json:"locked"`
-	// LockedUntil is the temporary lockout after too many failed logins.
-	LockedUntil  *time.Time `json:"locked_until"`
-	TOTPLastStep *int64     `json:"-"`
+	// LockedUntil is the temporary lockout after too many failed password logins.
+	LockedUntil *time.Time `json:"locked_until"`
+	// MfaLockedUntil is the temporary lockout after too many failed TOTP attempts
+	// (internal security audit N11).
+	MfaLockedUntil *time.Time `json:"-"`
+	TOTPLastStep   *int64     `json:"-"`
 	// Kind is human (logs in interactively) or machine (client credentials).
 	Kind             string    `json:"kind"`
 	ClientID         *string   `json:"client_id,omitempty"`
@@ -66,20 +69,29 @@ func (s *Store) SetClientSecret(ctx context.Context, userID, secretHash string) 
 // MFARequired reports whether login must include a second factor.
 func (u *User) MFARequired() bool { return u.TOTPVerified }
 
-// IsLocked reports a manual lock or an active temporary lockout.
+// IsLocked reports a manual lock or an active temporary password lockout.
 func (u *User) IsLocked() bool {
 	return u.Locked || (u.LockedUntil != nil && u.LockedUntil.After(time.Now()))
 }
 
+// IsMFALocked reports a manual lock or an active temporary TOTP lockout. A
+// password lockout (LockedUntil) deliberately does not block the TOTP step, so
+// a password-guesser cannot deny a valid SSO user's second factor; a TOTP
+// lockout still blocks the password and reset paths via ReserveAttempt
+// (internal security audit N11).
+func (u *User) IsMFALocked() bool {
+	return u.Locked || (u.MfaLockedUntil != nil && u.MfaLockedUntil.After(time.Now()))
+}
+
 const userColumns = `id, org_id, username, email, email_verified, given_name, family_name,
 	password_hash, totp_secret_enc, totp_verified, failed_logins, locked, locked_until,
-	totp_last_step, created_at, updated_at, kind, client_id, client_secret_hash`
+	mfa_locked_until, totp_last_step, created_at, updated_at, kind, client_id, client_secret_hash`
 
 func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	if err := row.Scan(&u.ID, &u.OrgID, &u.Username, &u.Email, &u.EmailVerified, &u.GivenName,
 		&u.FamilyName, &u.PasswordHash, &u.TOTPSecretEnc, &u.TOTPVerified, &u.FailedLogins,
-		&u.Locked, &u.LockedUntil, &u.TOTPLastStep, &u.CreatedAt, &u.UpdatedAt, &u.Kind, &u.ClientID,
+		&u.Locked, &u.LockedUntil, &u.MfaLockedUntil, &u.TOTPLastStep, &u.CreatedAt, &u.UpdatedAt, &u.Kind, &u.ClientID,
 		&u.ClientSecretHash); err != nil {
 		return nil, mapErr(err)
 	}
@@ -187,13 +199,35 @@ const (
 	FactorTOTP     Factor = "mfa_failed_logins"
 )
 
-// ReserveAttempt counts an attempt. It returns false if the user is locked
-// or max attempts are already counted (possibly by requests still running).
+// lockCol is the temporary-lockout column a failure of factor f sets.
+func lockCol(f Factor) string {
+	if f == FactorTOTP {
+		return "mfa_locked_until"
+	}
+	return "locked_until"
+}
+
+// lockBlocks is the SQL predicate that must hold for a new attempt of factor f
+// to be allowed: no manual lock and no lockout that blocks f is active. A TOTP
+// lockout (mfa_locked_until) blocks both factors, so it cannot be bypassed by
+// falling back to the password or reset path (anti-bypass); a password lockout
+// (locked_until) blocks only the password factor (internal security audit N11).
+func lockBlocks(f Factor) string {
+	mfa := "(mfa_locked_until IS NULL OR mfa_locked_until <= now())"
+	if f == FactorTOTP {
+		return "NOT locked AND " + mfa
+	}
+	return "NOT locked AND (locked_until IS NULL OR locked_until <= now()) AND " + mfa
+}
+
+// ReserveAttempt counts an attempt. It returns false if the user is locked for
+// this factor or max attempts are already counted (possibly by requests still
+// running).
 func (s *Store) ReserveAttempt(ctx context.Context, id string, f Factor, max int) (bool, error) {
 	col := string(f) // fixed column name, never user input
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE users SET `+col+` = `+col+` + 1
-		WHERE id = $1 AND `+col+` < $2 AND NOT locked AND (locked_until IS NULL OR locked_until <= now())`,
+		WHERE id = $1 AND `+col+` < $2 AND `+lockBlocks(f),
 		id, max)
 	if err != nil {
 		return false, mapErr(err)
@@ -205,11 +239,12 @@ func (s *Store) ReserveAttempt(ctx context.Context, id string, f Factor, max int
 // are counted the user is locked out for lockFor and the counter starts over.
 func (s *Store) AttemptFailed(ctx context.Context, id string, f Factor, max int, lockFor time.Duration) (locked bool, err error) {
 	col := string(f)
+	lc := lockCol(f) // fixed column name, never user input
 	err = s.pool.QueryRow(ctx, `
 		UPDATE users SET
-			locked_until = CASE WHEN `+col+` >= $2 THEN now() + make_interval(secs => $3) ELSE locked_until END,
-			`+col+`      = CASE WHEN `+col+` >= $2 THEN 0 ELSE `+col+` END
-		WHERE id = $1 RETURNING locked_until IS NOT NULL AND locked_until > now()`,
+			`+lc+`  = CASE WHEN `+col+` >= $2 THEN now() + make_interval(secs => $3) ELSE `+lc+` END,
+			`+col+` = CASE WHEN `+col+` >= $2 THEN 0 ELSE `+col+` END
+		WHERE id = $1 RETURNING `+lc+` IS NOT NULL AND `+lc+` > now()`,
 		id, max, lockFor.Seconds()).Scan(&locked)
 	return locked, mapErr(err)
 }
@@ -230,7 +265,8 @@ func (s *Store) UpgradePasswordHash(ctx context.Context, id, oldHash, newHash st
 // SetLocked sets or clears the manual lock and clears any temporary lockout.
 func (s *Store) SetLocked(ctx context.Context, id string, locked bool) error {
 	return s.execOne(ctx, `
-		UPDATE users SET locked = $2, locked_until = NULL, failed_logins = 0, mfa_failed_logins = 0, updated_at = now()
+		UPDATE users SET locked = $2, locked_until = NULL, mfa_locked_until = NULL,
+			failed_logins = 0, mfa_failed_logins = 0, updated_at = now()
 		WHERE id = $1`, id, locked)
 }
 

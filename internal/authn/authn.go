@@ -424,8 +424,11 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 	// the lockout threshold. Unknown and locked users take the same path and
 	// time, and get the same answer as a wrong password; a locked account's
 	// password is never evaluated.
+	// The password factor is blocked by a password lockout and, so a TOTP
+	// lockout cannot be bypassed via the password/reset path, by a TOTP lockout
+	// too (internal security audit N11). ReserveAttempt enforces the same in SQL.
 	reserved := false
-	if user != nil && !user.IsLocked() {
+	if user != nil && !user.IsLocked() && !user.IsMFALocked() {
 		if reserved, err = s.store.ReserveAttempt(ctx, user.ID, store.FactorPassword, s.cfg.MaxFailedLogins); err != nil {
 			return nil, err
 		}
@@ -476,7 +479,10 @@ func (s *Service) CheckTOTP(ctx context.Context, c Client, id, token, code strin
 	if !s.accountLimit.Allow(attemptKey(sess)) {
 		return nil, ErrRateLimited
 	}
-	if user.IsLocked() {
+	// Only a manual lock or the TOTP-specific lockout blocks the second factor;
+	// a password lockout must not, or a password-guesser could deny a valid SSO
+	// user's mandatory TOTP step (internal security audit N11).
+	if user.IsMFALocked() {
 		return nil, ErrLocked
 	}
 	reserved, err := s.store.ReserveAttempt(ctx, user.ID, store.FactorTOTP, s.cfg.MaxFailedLogins)

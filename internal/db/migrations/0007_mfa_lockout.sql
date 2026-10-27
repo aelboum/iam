@@ -1,0 +1,14 @@
+-- Per-factor temporary lockout (internal security audit N11, Option A).
+--
+-- The temporary failed-login lockout used one shared column, locked_until, set
+-- by either a password or a TOTP failure, so a password-guess lockout also
+-- blocked a valid SSO user's mandatory TOTP step. This column splits the TOTP
+-- lockout out: locked_until now bounds password guessing, mfa_locked_until
+-- bounds TOTP guessing. The password path is blocked by either lockout (so a
+-- TOTP lockout still blocks the password and reset paths — anti-bypass), while
+-- the TOTP path is blocked only by its own lockout.
+--
+-- Additive and nullable: NULL means "not locked", so there is no backfill and
+-- the change is forward-safe. On rollback the previous binary simply never reads
+-- this column (it falls back to the shared locked_until), losing nothing.
+ALTER TABLE users ADD COLUMN mfa_locked_until timestamptz;

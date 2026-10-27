@@ -436,6 +436,18 @@ def main():
     st = api(login_key, "POST", f"/sessions/{sess3['session_id']}/totp",
              {"session_token": sess3["session_token"], "code": t.totp_code(en["secret"])})
     check(st["authenticated"] and st["amr"] == ["fed", "otp", "mfa"], f"SSO plus TOTP authenticates ({st.get('amr')})")
+    # N11: a password-guess lockout on the SSO user must not block the TOTP step.
+    for _ in range(5):
+        t.password_step(login_key, acme["slug"], jit["username"], "definitely-the-wrong-pw")
+    _, pstatus, _ = t.password_step(login_key, acme["slug"], jit["username"], "definitely-the-wrong-pw")
+    check(pstatus == 401, f"the SSO user's password factor is locked out ({pstatus})")
+    sess_n11, _, _, _ = sso_login(idp["id"])
+    check(not sess_n11["authenticated"] and sess_n11["mfa_required"], "SSO still requires TOTP during the password lockout")
+    print("     waiting for the next TOTP window (N11)...")
+    time.sleep(30 - time.time() % 30 + 1)
+    stn = api(login_key, "POST", f"/sessions/{sess_n11['session_id']}/totp",
+              {"session_token": sess_n11["session_token"], "code": t.totp_code(en["secret"])})
+    check(stn["authenticated"], "TOTP completes the SSO login despite the password lockout (N11 fix)")
     trusted = api(key, "PUT", f"/orgs/{acme['id']}/idps/{idp['id']}/trust", {"trust_email": True, "trust_mfa": True})
     check(trusted["trust_mfa"] is True, "instance admin sets the IdP trust policy")
     sess4, _, _, _ = sso_login(idp["id"])
