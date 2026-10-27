@@ -143,6 +143,28 @@ def main():
     acme = api(key, "POST", "/orgs", {"name": "Acme", "slug": f"facme-{sfx}"})
     api(key, "POST", f"/projects/{project['id']}/grants", {"org_id": acme["id"], "role_keys": ["admin", "reader"]})
 
+    # --- project-grant modification authorization (internal audit N20/F2) --------------------
+    # Boundaries that hold regardless of the pending owner-decision on who may
+    # adjust an existing grant's role set: the granted org cannot modify the grant
+    # it received, an unrelated org cannot touch it, and the role set stays
+    # confined to the owning project's defined roles.
+    grant = api(key, "GET", f"/projects/{project['id']}/grants")[0]
+    acme_key = api(key, "POST", f"/orgs/{acme['id']}/api-keys", {"name": "acme admin"})["key"]
+    other = api(key, "POST", "/orgs", {"name": "Other", "slug": f"fother-{sfx}"})
+    other_key = api(key, "POST", f"/orgs/{other['id']}/api-keys", {"name": "other admin"})["key"]
+    status, _, _ = http("PATCH", f"/v1/project-grants/{grant['id']}", {"role_keys": ["admin", "reader"]},
+                        {"Authorization": "Bearer " + acme_key})
+    check(status in (403, 404), f"granted org cannot modify its own project grant ({status})")
+    status, _, _ = http("PATCH", f"/v1/project-grants/{grant['id']}", {"role_keys": ["admin"]},
+                        {"Authorization": "Bearer " + other_key})
+    check(status == 404, f"unrelated org cannot modify a project grant ({status})")
+    status, _, _ = http("DELETE", f"/v1/project-grants/{grant['id']}", None,
+                        {"Authorization": "Bearer " + other_key})
+    check(status == 404, f"unrelated org cannot delete a project grant ({status})")
+    status, _, _ = http("PATCH", f"/v1/project-grants/{grant['id']}", {"role_keys": ["nonexistent"]},
+                        {"Authorization": "Bearer " + key})
+    check(status == 400, f"a project grant cannot list a role the project has not defined ({status})")
+
     # --- password reset ---------------------------------------------------------------------
     api(key, "POST", f"/orgs/{acme['id']}/users", {"username": "rita", "email": "rita@acme.test", "password": "correct-horse-0"})
     reset = api(login_key, "POST", "/password-resets", {"org": acme["slug"], "login_name": "rita"}, expect=(202,))
