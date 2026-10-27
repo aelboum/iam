@@ -26,6 +26,7 @@ import (
 	"github.com/aelboum/iam/internal/oidcop"
 	"github.com/aelboum/iam/internal/ratelimit"
 	"github.com/aelboum/iam/internal/secret"
+	"github.com/aelboum/iam/internal/sizing"
 	"github.com/aelboum/iam/internal/store"
 )
 
@@ -62,6 +63,27 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// Size the process-wide password-hashing pool and check it against the
+	// container's memory limit before serving. Each slot can hold ~64 MiB
+	// resident while hashing, so an oversized pool risks OOM (internal security
+	// audit N12). An unknown memory limit (non-Linux, or no cgroup) yields no
+	// judgement; a known, insufficient limit warns, or fails fast under
+	// IAM_STRICT_SIZING.
+	slots := cfg.HashSlots
+	if slots == 0 {
+		slots = sizing.AutoHashSlots()
+	}
+	limitBytes, known := sizing.MemoryLimit()
+	if warn, ok := sizing.Check(slots, limitBytes, known); !ok {
+		if cfg.StrictSizing {
+			return errors.New(warn)
+		}
+		slog.Warn(warn)
+	}
+	authn.ConfigureHashSlots(slots)
+	slog.Info("password-hashing pool sized", "slots", slots, "auto", cfg.HashSlots == 0, "mem_limit_known", known)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

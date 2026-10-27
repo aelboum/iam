@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
-	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -25,6 +24,7 @@ import (
 
 	"github.com/aelboum/iam/internal/ratelimit"
 	"github.com/aelboum/iam/internal/secret"
+	"github.com/aelboum/iam/internal/sizing"
 	"github.com/aelboum/iam/internal/store"
 )
 
@@ -566,9 +566,21 @@ func (s *Service) attemptFailed(ctx context.Context, c Client, user *store.User,
 	return ErrInvalidCredentials
 }
 
-// hashSlots bounds concurrent password hashing. Each argon2id run uses about
-// 64 MiB, so unbounded parallel requests could exhaust memory.
-var hashSlots = make(chan struct{}, max(2, runtime.NumCPU()))
+// hashSlots bounds concurrent password hashing across the whole process. Each
+// argon2id run uses about 64 MiB, so unbounded parallel requests could exhaust
+// memory. It defaults to a container-aware slot count (GOMAXPROCS, floored at 2)
+// and can be resized once at startup by ConfigureHashSlots.
+var hashSlots = make(chan struct{}, sizing.AutoHashSlots())
+
+// ConfigureHashSlots sets the size of the process-wide hashing pool. It replaces
+// the semaphore, so it must be called once at startup before the engine begins
+// serving — the goroutine-creation that starts the HTTP server establishes the
+// happens-before that makes the new value visible to request handlers. A count
+// below 2 is floored at 2 so the pool is never degenerate. It is a no-op scope
+// for tests, which drive the default pool directly.
+func ConfigureHashSlots(slots int) {
+	hashSlots = make(chan struct{}, max(2, slots))
+}
 
 // acquireHashSlot waits up to HashWaitTimeout for a hashing slot. If none frees
 // in time it sheds the request as ErrOverloaded (mapped to HTTP 503) instead of

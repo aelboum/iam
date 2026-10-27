@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aelboum/iam/internal/sizing"
 )
 
 type Config struct {
@@ -57,6 +59,15 @@ type Config struct {
 	// tenant cannot monopolize the shared hashing capacity (internal security
 	// audit N12/A4).
 	OrgLoginLimit int
+	// HashSlots is the number of concurrent argon2id password hashes allowed
+	// across the process. 0 means auto-size from GOMAXPROCS (container-aware).
+	// Each slot can hold ~64 MiB resident while hashing (internal security audit
+	// N12).
+	HashSlots int
+	// StrictSizing makes an insufficient-memory sizing check fatal at startup
+	// instead of a warning, so a misconfigured deployment fails fast rather than
+	// risking OOM under load.
+	StrictSizing bool
 
 	// Passkeys: the relying party ID (a domain) and the login UI origins.
 	WebAuthnRPID    string
@@ -119,6 +130,16 @@ func Load() (*Config, error) {
 		return nil, errors.New("IAM_ORG_LOGIN_LIMIT must be a positive integer (password logins per org per minute)")
 	}
 	cfg.OrgLoginLimit = orgLimit
+
+	// IAM_HASH_SLOTS: 0 (or unset) means auto-size from GOMAXPROCS at startup.
+	// A positive count overrides it, bounded so a typo cannot request a pool whose
+	// peak hashing memory is absurd.
+	slots, err := strconv.Atoi(env("IAM_HASH_SLOTS", "0"))
+	if err != nil || slots < 0 || slots > sizing.MaxHashSlots {
+		return nil, fmt.Errorf("IAM_HASH_SLOTS must be an integer between 0 (auto) and %d", sizing.MaxHashSlots)
+	}
+	cfg.HashSlots = slots
+	cfg.StrictSizing = os.Getenv("IAM_STRICT_SIZING") == "true"
 	if cfg.Issuer == "" {
 		return nil, errors.New("IAM_ISSUER is required")
 	}
