@@ -379,9 +379,14 @@ func limitOAuthEndpoints(limits ratelimit.Factory) func(http.Handler) http.Handl
 	limiter := limits("oauth", 120, 60)
 	// /authorize stores a pending request per call, so it is limited too.
 	authorizeLimiter := limits("authorize", 60, 30)
+	// The federated-login callback is public and unauthenticated; each call
+	// hashes the state and probes idp_intents, so limit it per IP like the other
+	// public OAuth endpoints rather than leave it as an unthrottled DB-load vector.
+	callbackLimiter := limits("idp-callback", 60, 30)
 	limited := map[string]ratelimit.Allower{
 		"/oauth/token": limiter, "/oauth/introspect": limiter, "/revoke": limiter,
 		"/authorize": authorizeLimiter, "/authorize/callback": authorizeLimiter,
+		authn.CallbackPath: callbackLimiter,
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
