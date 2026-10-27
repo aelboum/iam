@@ -12,11 +12,11 @@
 #                        migration state and the data intact, and a second
 #                        engine run against the restored target applies zero
 #                        further migrations (idempotent / consistent).
-#   C. UPGRADE PATH    - a database left at the pre-0007 state (only
-#                        0001..0006 applied) is upgraded by the engine, which
-#                        applies exactly 0007, and a generic OIDC provider row
-#                        that pre-dates 0007 survives as provider_type='oidc'
-#                        with an empty tenant.
+#   C. UPGRADE PATH    - a database left pending only 0007_social_login (every
+#                        other migration applied) is upgraded by the engine,
+#                        which applies exactly that migration, and a generic OIDC
+#                        provider row that pre-dates it survives as
+#                        provider_type='oidc' with an empty tenant.
 #
 # Everything it creates is named with a unique run id and removed on exit, so
 # it never touches a developer's running stack or any other container. It makes
@@ -175,12 +175,14 @@ COUNT_B2="$(psql_q "$PG_B" 'SELECT count(*) FROM schema_migrations;')"
 log "C. UPGRADE PATH: pre-0007 database upgraded by the engine"
 ############################################################################
 PG_C="$(start_pg pg-upgrade)"
-# Apply only 0001..0006 by hand and record them, leaving 0007 pending.
+# Apply every migration except 0007_social_login by hand and record them,
+# leaving exactly that one pending (there are two 0007-prefixed migrations, so
+# this names the file rather than globbing 0007_*).
 docker exec "$PG_C" psql -U iam -d iam -q -c \
   "CREATE TABLE IF NOT EXISTS schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());" >/dev/null
 for f in "${MIG_FILES[@]}"; do
   case "$f" in
-    0007_*) continue ;;
+    0007_social_login.sql) continue ;;
   esac
   docker exec -i "$PG_C" psql -U iam -d iam -q -v ON_ERROR_STOP=1 < "$MIG_DIR/$f" >/dev/null
   docker exec "$PG_C" psql -U iam -d iam -q -c \
