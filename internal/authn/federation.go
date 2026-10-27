@@ -271,7 +271,14 @@ func (s *Service) resolveFederatedUser(ctx context.Context, idp *store.IDP, clai
 	} else if n >= store.MaxUsersPerOrg {
 		return nil, ErrNoAccount
 	}
-	if email == "" {
+	// An IdP email becomes the account's identity only when the trust policy
+	// treats it as verified (trust_email + an IdP-asserted verified claim). For
+	// an untrusted or unverified email — or none at all — store a synthetic,
+	// deterministic placeholder in the reserved `.invalid` domain instead, so an
+	// untrusted email is never a login identity, never squats the real address,
+	// and never becomes a password-reset or verification target (internal
+	// security audit N13).
+	if !verified {
 		sum := sha256.Sum256([]byte(idp.ID + "\x00" + claims.Subject))
 		email = "idp-" + hex.EncodeToString(sum[:8]) + "@idp.invalid"
 	}

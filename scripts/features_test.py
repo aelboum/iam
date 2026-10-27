@@ -354,7 +354,7 @@ def main():
     def browser_binding():
         return secrets.token_urlsafe(32)  # what the login UI keeps in an HttpOnly cookie
 
-    def sso_callback(idp_id, binding):
+    def sso_callback(idp_id, binding, login_name="carl", password="corp-pass-123"):
         """Runs the browser round trip; returns the login UI return URL query."""
         start = api(login_key, "POST", "/federated-logins",
                     {"org": acme["slug"], "idp_id": idp_id, "return_url": "http://localhost:3000/sso-return",
@@ -362,8 +362,8 @@ def main():
         # Browser: engine-as-IdP authorize -> corp login UI (session API) -> corp callback -> engine /idp/callback.
         loc = http("GET", start["auth_url"])[2]["Location"]
         corp_ar = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["authRequest"][0]
-        cs = api(login_key, "POST", "/sessions", {"org": corp["slug"], "login_name": "carl"})
-        api(login_key, "POST", f"/sessions/{cs['session_id']}/password", {"session_token": cs["session_token"], "password": "corp-pass-123"})
+        cs = api(login_key, "POST", "/sessions", {"org": corp["slug"], "login_name": login_name})
+        api(login_key, "POST", f"/sessions/{cs['session_id']}/password", {"session_token": cs["session_token"], "password": password})
         fin = api(login_key, "POST", f"/auth-requests/{corp_ar}/finalize", {"session_id": cs["session_id"], "session_token": cs["session_token"]})
         idp_cb = http("GET", fin["callback_url"])[2]["Location"]
         check(idp_cb.startswith(callback), "IdP redirects back to the engine callback")
@@ -376,9 +376,9 @@ def main():
         return http("POST", f"/v1/federated-logins/{q['intent'][0]}/redeem", {"code": q["code"][0], "browser_binding": binding},
                     {"Authorization": "Bearer " + login_key})
 
-    def sso_login(idp_id):
+    def sso_login(idp_id, login_name="carl", password="corp-pass-123"):
         binding = browser_binding()
-        q, idp_cb = sso_callback(idp_id, binding)
+        q, idp_cb = sso_callback(idp_id, binding, login_name, password)
         check("code" in q, f"engine verifies the IdP login ({q.get('error')})")
         replay_status, _, _ = http("GET", idp_cb)
         status, sess, _ = redeem(q, binding)
@@ -406,10 +406,22 @@ def main():
     status, _, _ = redeem(q, binding)
     check(status == 401, "SSO redeem code works only once")
     idt, _ = finalize_and_exchange(login_key, start_authorize(app["client_id"]), sess, app_basic)
-    check(idt["email"] == "carl@corp.test" and idt["org_id"] == acme["id"], "SSO user created just-in-time in the customer org")
+    check(idt["org_id"] == acme["id"], "SSO user created just-in-time in the customer org")
     first_sub = idt["sub"]
     jit = api(key, "GET", f"/users/{first_sub}")
     check(jit["email_verified"] is False, "IdP email_verified is not trusted without trust_email (M2, reproduction F1)")
+    # N13: an untrusted IdP email (trust_email off) must never become the account identity.
+    check(jit["email"].endswith("@idp.invalid") and jit["email"] != "carl@corp.test",
+          "untrusted IdP email stored as a synthetic placeholder, not the claimed address (N13)")
+    check(idt["email"].endswith("@idp.invalid"),
+          "the JIT user's token carries the placeholder, not the untrusted address (N13)")
+    # Recovery cannot adopt the federated account via the claimed address...
+    check(api(login_key, "POST", "/password-resets", {"org": acme["slug"], "login_name": "carl@corp.test"}, expect=(202,)) == {},
+          "a reset for the untrusted claimed address finds no account (no federated-account adoption) (N13)")
+    # ...and the real address stays free for a genuine user (no squat).
+    realcarl = api(key, "POST", f"/orgs/{acme['id']}/users",
+                   {"username": "genuine-user", "email": "carl@corp.test", "password": "Wobble-Mountain-93"})
+    check(realcarl["email"] == "carl@corp.test", "the untrusted IdP did not squat the real address (N13)")
     sess2, _, _, _ = sso_login(idp["id"])
     idt2, _ = finalize_and_exchange(login_key, start_authorize(app["client_id"]), sess2, app_basic)
     check(idt2["sub"] == first_sub, "second SSO login links to the same user")
@@ -428,6 +440,14 @@ def main():
     check(trusted["trust_mfa"] is True, "instance admin sets the IdP trust policy")
     sess4, _, _, _ = sso_login(idp["id"])
     check(sess4["authenticated"] and sess4["amr"] == ["fed", "mfa"], "trusted IdP satisfies MFA (amr fed mfa)")
+    # N13 positive: with trust_email now on, a verified IdP email provisions the real address.
+    api(key, "POST", f"/orgs/{corp['id']}/users",
+        {"username": "dora", "email": "dora@corp.test", "email_verified": True, "password": "corp-pass-456"})
+    dsess, _, _, _ = sso_login(idp["id"], "dora", "corp-pass-456")
+    didt, _ = finalize_and_exchange(login_key, start_authorize(app["client_id"]), dsess, app_basic)
+    dora_jit = api(key, "GET", f"/users/{didt['sub']}")
+    check(dora_jit["email"] == "dora@corp.test" and dora_jit["email_verified"] is True,
+          "a trust_email IdP's verified email provisions the real, verified address (N13)")
 
     # --- passkeys -------------------------------------------------------------------------------
     pia = api(key, "POST", f"/orgs/{acme['id']}/users", {"username": "pia", "email": "pia@acme.test", "given_name": "Pia"})
