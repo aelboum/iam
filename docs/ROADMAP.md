@@ -42,6 +42,29 @@ fixed in `8b438c9`, two kept for consistency with existing conventions).
 | e2e smoke/feature suites | **NOT RUN this session** | Require a running engine + Python `cryptography`; CI job `e2e` covers them. | Re-run via CI when pushed, or locally against a disposable engine. | partial |
 | Independent penetration test | **NOT PERFORMED** | Unchanged by this work. Internal AI review, unit/integration tests, `govulncheck`, `gitleaks` and successful CI do **not** substitute for it. | Commission an independent external tester (PENTEST.md); separate authorization. Production remains **NO-GO** while this gate is open. | **no** |
 
+## OIDC token-lifecycle & machine-client authorization audit (code readiness, 2026-10-28)
+
+Read-only audit of the OIDC token-lifecycle and machine-client authorization
+surface, plus **test-only** regression guards on local branch
+`test-oidc-token-lifecycle` (off `main` `0ac28ee`) — **no production code
+changed; not pushed; no defect found.** Validated with Go 1.27.3 (`gofmt`,
+`go vet ./...`, `go build ./...`, `go test ./...`) against disposable Postgres
+16; `-race` and `e2e` remain CI-only here. `govulncheck ./...` reports 0
+code-reachable vulnerabilities on this line of work (1 vuln in a required module
+not called — the documented GO-2026-5932 disposition); `gitleaks` is CI-only
+(not installed locally).
+
+| Guard | Commit | Property pinned | Status |
+|-------|--------|-----------------|--------|
+| OIDC logout / refresh rotation / reuse | `2424965` | `TerminateTokens` = per user+client (not whole user); `RotateRefreshToken` consumes the presented token and issues the next in the same family; presenting a rotated-out (used) refresh token revokes the **whole family** and nothing else; unknown/expired → existing error contract. | PASS (code + local tests) |
+| RFC 7009 `RevokeToken` scope | `ea9936f` | Refresh-token revoke = whole family; access-token revoke = that token only (family stays); client_id mismatch → `invalid_client`, nothing revoked (both token types); unknown / already-revoked = idempotent no-op; other family/user/client+tenant untouched. | PASS (code + local tests) |
+| `DeleteAccessToken` dangling contract | `e741ed0` | No FK between access/refresh tokens (plain uuid; subject/client_id text), so the delete removes only the target access token, leaves the linked refresh family alive, touches no other token; unknown id = no-op. | PASS (code + local tests) |
+| Live introspection after grant change | `e741ed0` | `SetIntrospectionFromToken` is a live decision on an **opaque** bearer token: narrowing a project grant drops the forbidden roles and revoking it reports the token inactive on the next call; a caller from another project cannot introspect it; a second tenant stays isolated. Scope limit documented: self-contained **JWT** access tokens are validated at the resource server and are **not** retroactively invalidated by a grant change until they expire (≈5m TTL). | PASS (code + local tests) |
+| Machine-user introspection | `b76f39e` | Machine token carries its project via `urn:iam:project:<id>` scope; authorized like a human via `checkUserCanUseProject`→`AvailableRoles(project, machine.OrgID)`. Naming a project in the scope grants nothing; the owner org is always authorized without a grant row (documented difference). Store `DeleteProjectGrant` fails only the live check (token row survives); `RevokeProjectTokens` physically deletes the scope-matched token — two separate guarantees. | PASS (code + local tests) |
+| Machine `client_credentials` grant re-check | `9b951ee` | A new token request re-checks the scoped project live via `AvailableRoles`; after the org's grant is revoked the next request is refused with `invalid_scope` (no new token), while another granted tenant is unaffected. Machine users have only the client_credentials grant (no refresh flow). | PASS (code + local tests) |
+| Machine `client_credentials` scope-storage contract | `3c1be3f` | Only one `urn:iam:project:<uuid>` with a usable grant is honoured; empty-string safely dropped; `openid`/`offline_access`/unknown/second-project/malformed-uuid each **explicitly** refused `invalid_scope` (no silent pass-through); the stored/issued token carries only the validated scope; a refused request writes no token/refresh row and mutates no grant. | PASS (code + local tests) |
+| Independent penetration test | — | **NOT PERFORMED.** Unchanged by this work; internal/AI/automated analysis is not a substitute. Production remains **NO-GO** while criterion 12 is open. | NOT PERFORMED |
+
 ## Required external prerequisites (the only items blocking the remaining work)
 
 To unblock WS5–7 (and therefore WS9), the following **non-production** registrations
