@@ -43,6 +43,11 @@ Optional (default in parentheses, from `config.go`):
   `IAM_WEBAUTHN_ORIGINS` (defaults to the issuer origin) — set both to the login
   UI's real domain and origin(s); invalid values fail fast at boot.
 
+Boolean variables (`IAM_DEV_MODE`, `IAM_ENABLE_DOCS`, `IAM_TRUST_PROXY`,
+`IAM_SHARED_RATE_LIMITS`, `IAM_STRICT_SIZING`) are enabled **only** by the exact
+string `true`. Any other value — `1`, `TRUE`, `yes`, `on` — leaves the flag off;
+there is no error, so a typo silently keeps the safe default.
+
 Lockout threshold is 5 failed attempts (`MaxFailedLogins`, per factor).
 
 ## Secret management (runbook)
@@ -110,6 +115,31 @@ get a slot within `IAM_HASH_WAIT_TIMEOUT` are shed with HTTP 503 (distinct from 
   endpoints under legitimate load, raise `IAM_HASH_SLOTS` *and* the memory limit
   together, or scale out horizontally. Watch the `shed_total` fields in the
   "overloaded" / "per-org login budget" warning logs (see monitoring below).
+
+## Rate limiting
+
+Public, unauthenticated endpoints are rate limited **per client IP** (the IP is
+resolved per the trusted-proxy settings above). Exceeding a limit returns
+`429 Too Many Requests` with `Retry-After: 60` and a JSON `{"error":"slow_down"}`
+body. The limits (requests per minute / burst), from `limitOAuthEndpoints` in
+`cmd/iamd/main.go`:
+
+- `/oauth/token`, `/oauth/introspect`, `/revoke` — 120 / 60.
+- `/authorize`, `/authorize/callback` — 60 / 30.
+- `/idp/callback` (the federated-login callback) — 60 / 30. This endpoint is
+  unauthenticated and hashes the `state` parameter and probes `idp_intents` on
+  every call, so it carries the same per-IP limit as the other public endpoints
+  to prevent it being used as a database-load amplifier.
+
+Authenticated login/management endpoints under `/v1` are additionally limited by
+the login API key (`login-key`, 1200/300) and per IP (`login-ip`, 30/20), and
+password/TOTP attempts are bounded per account (`login-account`, 10/10) and per
+organization (`IAM_ORG_LOGIN_LIMIT`, default 1200/min). With
+`IAM_SHARED_RATE_LIMITS=true` these counts are aggregated across instances in
+Postgres (sliding one-minute window); each instance still applies its local
+limit first. A failed authentication that is shed by a limiter returns 429; a
+transient password-hashing overload returns 503 with `Retry-After: 1` (see
+"Capacity and overload"), which is distinct from a 429 rate limit.
 
 ## Health and readiness
 

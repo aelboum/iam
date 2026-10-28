@@ -481,7 +481,7 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 		// leaking which accounts exist (internal security audit N12).
 		if errors.Is(s.verifyDummy(password), ErrOverloaded) {
 			if reserved {
-				s.releaseAttempt(ctx, user.ID)
+				s.releaseAttempt(ctx, user.ID, store.FactorPassword)
 			}
 			return nil, ErrOverloaded
 		}
@@ -502,7 +502,7 @@ func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, passwo
 		// means the password was never evaluated. Release the reserved attempt so
 		// a transient shed does not count as a failure and push a real user toward
 		// lockout, then surface the error (internal security audit N12).
-		s.releaseAttempt(ctx, user.ID)
+		s.releaseAttempt(ctx, user.ID, store.FactorPassword)
 		return nil, verr
 	}
 	if updated != "" {
@@ -549,6 +549,11 @@ func (s *Service) CheckTOTP(ctx context.Context, c Client, id, token, code strin
 	}
 	ok, err := s.acceptTOTP(ctx, user, code)
 	if err != nil {
+		// The code was never evaluated (e.g. an unreadable TOTP secret or a
+		// transient store error), so release the reserved attempt rather than let
+		// it advance the MFA lockout counter, mirroring the password path
+		// (internal security audit N12).
+		s.releaseAttempt(ctx, user.ID, store.FactorTOTP)
 		return nil, err
 	}
 	if !ok {
@@ -675,12 +680,14 @@ func (s *Service) verifyDummy(password string) error {
 	return nil
 }
 
-// releaseAttempt best-effort undoes a reserved login attempt that was never
-// evaluated because hashing was shed. A failure here must not mask the error
-// already being returned to the caller, so it is only logged.
-func (s *Service) releaseAttempt(ctx context.Context, userID string) {
-	if err := s.store.ReleaseAttempt(ctx, userID, store.FactorPassword); err != nil {
-		slog.Warn("could not release an unevaluated login attempt", "error", err)
+// releaseAttempt best-effort undoes a reserved login attempt for factor f that
+// was never evaluated — because hashing was shed under overload (password) or an
+// internal error prevented the factor from being checked (e.g. an unreadable
+// TOTP secret). A failure here must not mask the error already being returned to
+// the caller, so it is only logged.
+func (s *Service) releaseAttempt(ctx context.Context, userID string, f store.Factor) {
+	if err := s.store.ReleaseAttempt(ctx, userID, f); err != nil {
+		slog.Warn("could not release an unevaluated login attempt", "factor", f, "error", err)
 	}
 }
 

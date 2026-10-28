@@ -65,6 +65,87 @@ not called — the documented GO-2026-5932 disposition); `gitleaks` is CI-only
 | Machine `client_credentials` scope-storage contract | `3c1be3f` | Only one `urn:iam:project:<uuid>` with a usable grant is honoured; empty-string safely dropped; `openid`/`offline_access`/unknown/second-project/malformed-uuid each **explicitly** refused `invalid_scope` (no silent pass-through); the stored/issued token carries only the validated scope; a refused request writes no token/refresh row and mutates no grant. | PASS (code + local tests) |
 | Independent penetration test | — | **NOT PERFORMED.** Unchanged by this work; internal/AI/automated analysis is not a substitute. Production remains **NO-GO** while criterion 12 is open. | NOT PERFORMED |
 
+## Tenant isolation & authorization audit (code readiness, 2026-10-28)
+
+Read-only audit of the multi-tenant authorization boundary, plus **test-only**
+regression guards. On local branches off `main` (`0ac28ee`), each its own draft
+PR awaiting the operator's merge decision — **no production code changed; merges
+not authorized**. Validated with Go 1.27.3 (`gofmt`, `go vet`, package tests)
+against disposable Postgres 16; `-race` remains CI-only here.
+
+- **Session scope (PR #6, `68ff1b1`).** A session presented with another org's
+  id is rejected (`ErrSessionInvalid`) on every path; `loadSession` already
+  enforces it. Guard only.
+- **AvailableRoles (PR #6, `d19de5c`).** Project roles are offered only to the
+  owning org or an org holding an explicit project grant; any other org gets
+  `ok=false` and no roles. Guard only.
+- **EffectiveRoles (PR #6, `a942acd`, unpushed).** A user's effective roles are
+  the intersection of their assigned roles and what their org may currently hand
+  out, recomputed at read time — so narrowing or revoking the org's project grant
+  drops roles on the next resolution without rewriting each `user_grant` row.
+  Inspected chain: `api.userForCaller`→`canAccessOrg` blocks cross-org user ids
+  (404, no existence leak); `CreateUserGrant`/`UpdateUserGrant` enforce roleKeys ⊆
+  `AvailableRoles(user.OrgID)`; OIDC `checkUserCanUseClient`→app project→
+  `AvailableRoles`; `tokenProject` returns the app's own project (scope cannot
+  override); machine project-scope validated in `ClientCredentialsTokenRequest`.
+  No defect; guard only.
+- **Project-grant token revocation (PR #6, `d2a5250`, unpushed).** Research
+  question: can already-issued access tokens outlive a narrowed/removed grant?
+  **No defect — intended and safe by three independent layers.** (1) The API
+  handlers `updateProjectGrant`/`deleteProjectGrant` follow the grant change with
+  `store.RevokeProjectTokens(projectID, grantedOrgID)`, which deletes the org's
+  access **and** refresh tokens for the project's apps and any machine tokens
+  carrying the project scope, scoped to exactly that org+project. (2) Bearer-token
+  introspection (`SetIntrospectionFromToken`) re-runs `checkUserCanUseProject`, so
+  a revoked grant reports the token **inactive immediately** and a narrowed grant
+  yields reduced roles via a live `EffectiveRoles` recomputation — independent of
+  whether the row was deleted. (3) Access-token TTL is short (5m default) and the
+  refresh family is revoked, so no fresh token is minted. Regression guard
+  `TestProjectGrantChangeRevokesTokens` pins the scoping (a second tenant's tokens
+  for the same project and the same tenant's tokens for another project survive).
+  **Accepted limitation (not a defect):** a *self-contained JWT* access token
+  (`access_token_type=jwt`), validated by signature without introspection, is not
+  reflected until it expires; the bound is the access-token TTL plus the eager
+  refresh-family revocation — the standard short-lived-JWT tradeoff.
+  **Recommended follow-up — now done** (see the next bullet): the `internal/api`
+  handler-wiring test asserting the handlers call `RevokeProjectTokens` was added
+  in `3008d53`, closing the gap the store-level test could not see.
+- **Handler revocation wiring (PR #6, `3008d53`/`7084fb9`/`f291155`/`0866a5e`,
+  unpushed).** The `internal/api` guards now cover the handler->store
+  token-revocation wiring the store tests cannot see: `updateProjectGrant`/
+  `deleteProjectGrant` (org+project scoped, other tenant/project survive),
+  `lockUser`/`deleteUser` (only that user), `setPassword` (admin: revokes target
+  only; weak password → non-2xx, no revoke), and the self-service reset path
+  `ConfirmPasswordReset` (authn-level — **atomic in `CompletePasswordReset`'s
+  transaction**: access+refresh tokens, sessions and password_resets dropped
+  together; another user untouched; a bad token revokes nothing). `deleteApp`
+  (`f291155`) revokes only the deleted app's client tokens — a sibling app in the
+  same project and an app in another tenant survive, and a missing app fails at
+  the owner lookup before any revoke. `logoutUser` (`0866a5e`, force-logout via
+  `RevokeUserTokens`) revokes the target user across every client while other
+  users and other tenants stay intact — distinct from OIDC end-session
+  (`TerminateTokens`, per user+client). Established invariant: federation login
+  (`RedeemFederatedLogin`) and SSO account-linking (`LinkIdentity`) deliberately
+  **preserve** existing sessions and carry no revocation. All guards only.
+- **Org deletion token revocation (PR #6, unpushed).** `deleteOrg` revokes
+  **before** deleting (`RevokeOrgTokens` then `DeleteOrg`), because the token
+  lookup resolves subjects through the org's users, which must still exist; org
+  deletion cascades its users via FK, but access/refresh tokens have no FK
+  (subject is text), so a delete-first order would orphan them. `RevokeOrgTokens`
+  is a single transaction scoped to `subject IN (users WHERE org_id = $1)`, so
+  only the deleted org's tokens go; another org's survive. Guard
+  `TestDeleteOrgHandlerRevokesOnlyThatOrgsTokens` pins this (deleted org's tokens
+  gone, other org's survive, a non-existent org id yields a non-2xx error and no
+  revocation). **Atomicity (documented, not a defect):** revoke and delete are
+  two separate transactions. A failure of `DeleteOrg` after `RevokeOrgTokens`
+  leaves the org present with its tokens revoked — a fail-safe direction (users
+  re-authenticate; no access retained). A token minted by a concurrent login in
+  the narrow window between the two is not cascade-deleted, but its subject user
+  is gone, so introspection reports it inactive and it expires with its TTL; it
+  is also swept by `PurgeExpired`. No production change made; wrapping both in
+  one transaction is a possible future hardening, not required by a demonstrated
+  defect.
+
 ## Required external prerequisites (the only items blocking the remaining work)
 
 To unblock WS5–7 (and therefore WS9), the following **non-production** registrations
