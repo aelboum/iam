@@ -263,6 +263,52 @@ func TestDeleteOrgHandlerRevokesOnlyThatOrgsTokens(t *testing.T) {
 	h.mustAlive("delete-missing-org", survivor)
 }
 
+func TestDeleteAppHandlerRevokesOnlyThatAppsTokens(t *testing.T) {
+	st, pool := revocationTestStore(t)
+	srv := &Server{store: st}
+	h := newRevHelper(t, st, pool)
+
+	// One project holds the app under deletion plus a sibling app; a second
+	// project in a different tenant holds an unrelated app.
+	owner := h.org("owner")
+	other := h.org("other-tenant")
+	projP := h.project(owner, "P")
+	projOther := h.project(other, "O")
+
+	appDel := h.appRow(projP)       // the app being deleted
+	appSibling := h.appRow(projP)   // second app, same project, different client_id
+	appOther := h.appRow(projOther) // app in another project and tenant
+
+	user := h.user(owner)
+	userOther := h.user(other)
+
+	victim := h.token(appDel.ClientID, user.ID, nil)
+	sibling := h.token(appSibling.ClientID, user.ID, nil)
+	foreign := h.token(appOther.ClientID, userOther.ID, nil)
+
+	rec := httptest.NewRecorder()
+	srv.deleteApp(rec, adminReq(t, map[string]string{"appID": appDel.ID}, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("deleteApp: status=%d body=%s, want 204", rec.Code, rec.Body.String())
+	}
+	h.mustGone("delete-app", victim)
+	h.mustAlive("delete-app", sibling, foreign)
+	if _, err := st.GetApp(context.Background(), appDel.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted app still present: err=%v, want ErrNotFound", err)
+	}
+
+	// Error path: deleting a missing app fails at the lookup (appForOwner),
+	// before RevokeAppTokens runs, so a surviving app's tokens stay intact and
+	// the handler must report a non-2xx error.
+	keep := h.token(appSibling.ClientID, user.ID, nil)
+	rec = httptest.NewRecorder()
+	srv.deleteApp(rec, adminReq(t, map[string]string{"appID": uuid.NewString()}, nil))
+	if rec.Code >= 200 && rec.Code < 300 {
+		t.Fatalf("deleteApp on a missing app: status=%d, want a non-2xx error", rec.Code)
+	}
+	h.mustAlive("delete-missing-app", keep)
+}
+
 // --- test helper ------------------------------------------------------------
 
 type revHelper struct {
@@ -296,16 +342,19 @@ func (h *revHelper) project(owner *store.Org, name string) *store.Project {
 	return p
 }
 
-func (h *revHelper) app(proj *store.Project) string {
+func (h *revHelper) app(proj *store.Project) string { return h.appRow(proj).ClientID }
+
+func (h *revHelper) appRow(proj *store.Project) *store.App {
 	clientID := "client-" + uuid.NewString()
-	if _, err := h.st.CreateApp(h.ctx, store.App{
+	a, err := h.st.CreateApp(h.ctx, store.App{
 		ProjectID: proj.ID, Name: "app", ClientID: clientID, AppType: "web",
 		AuthMethod: "none", AccessTokenType: "bearer",
 		RedirectURIs: []string{}, PostLogoutRedirectURIs: []string{},
-	}); err != nil {
+	})
+	if err != nil {
 		h.t.Fatalf("create app: %v", err)
 	}
-	return clientID
+	return a
 }
 
 func (h *revHelper) grant(proj *store.Project, org *store.Org) *store.ProjectGrant {
