@@ -204,7 +204,7 @@ func TestSetPasswordHandlerRevokesOnlyTargetUser(t *testing.T) {
 	b := h.token(client, userB.ID, nil)
 	rec := httptest.NewRecorder()
 	// The new password must not contain the username or email.
-	srv.setPassword(rec, adminReq(t, map[string]string{"userID": userA.ID}, map[string]any{"password": "Str0ng-Passphrase-Qw7"}))
+	srv.setPassword(rec, adminReq(t, map[string]string{"userID": userA.ID}, map[string]any{"password": "some-password-1"}))
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("setPassword: status=%d body=%s, want 204", rec.Code, rec.Body.String())
 	}
