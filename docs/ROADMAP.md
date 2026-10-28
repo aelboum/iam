@@ -87,6 +87,35 @@ against disposable Postgres 16; `-race` remains CI-only here.
   **Recommended follow-up (not done):** an `internal/api` test asserting the
   handlers call `RevokeProjectTokens`, to guard the wiring the store-level test
   cannot see.
+- **Handler revocation wiring (PR #6, `3008d53`/`7084fb9`, unpushed).** The
+  `internal/api` guards now cover the handler->store token-revocation wiring the
+  store tests cannot see: `updateProjectGrant`/`deleteProjectGrant` (org+project
+  scoped, other tenant/project survive), `lockUser`/`deleteUser` (only that
+  user), `setPassword` (admin: revokes target only; weak password → non-2xx, no
+  revoke), and the self-service reset path `ConfirmPasswordReset` (authn-level —
+  **atomic in `CompletePasswordReset`'s transaction**: access+refresh tokens,
+  sessions and password_resets dropped together; another user untouched; a bad
+  token revokes nothing). Established invariant: federation login
+  (`RedeemFederatedLogin`) and SSO account-linking (`LinkIdentity`) deliberately
+  **preserve** existing sessions and carry no revocation. All guards only.
+- **Org deletion token revocation (PR #6, unpushed).** `deleteOrg` revokes
+  **before** deleting (`RevokeOrgTokens` then `DeleteOrg`), because the token
+  lookup resolves subjects through the org's users, which must still exist; org
+  deletion cascades its users via FK, but access/refresh tokens have no FK
+  (subject is text), so a delete-first order would orphan them. `RevokeOrgTokens`
+  is a single transaction scoped to `subject IN (users WHERE org_id = $1)`, so
+  only the deleted org's tokens go; another org's survive. Guard
+  `TestDeleteOrgHandlerRevokesOnlyThatOrgsTokens` pins this (deleted org's tokens
+  gone, other org's survive, a non-existent org id yields a non-2xx error and no
+  revocation). **Atomicity (documented, not a defect):** revoke and delete are
+  two separate transactions. A failure of `DeleteOrg` after `RevokeOrgTokens`
+  leaves the org present with its tokens revoked — a fail-safe direction (users
+  re-authenticate; no access retained). A token minted by a concurrent login in
+  the narrow window between the two is not cascade-deleted, but its subject user
+  is gone, so introspection reports it inactive and it expires with its TTL; it
+  is also swept by `PurgeExpired`. No production change made; wrapping both in
+  one transaction is a possible future hardening, not required by a demonstrated
+  defect.
 
 ## Required external prerequisites (the only items blocking the remaining work)
 

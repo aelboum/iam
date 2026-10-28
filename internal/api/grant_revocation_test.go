@@ -223,6 +223,46 @@ func TestSetPasswordHandlerRevokesOnlyTargetUser(t *testing.T) {
 	}
 }
 
+func TestDeleteOrgHandlerRevokesOnlyThatOrgsTokens(t *testing.T) {
+	st, pool := revocationTestStore(t)
+	srv := &Server{store: st}
+	h := newRevHelper(t, st, pool)
+
+	// Two orgs, each with a user and a token issued to the org's app.
+	orgDel := h.org("to-delete")
+	orgKeep := h.org("to-keep")
+	projDel := h.project(orgDel, "D")
+	projKeep := h.project(orgKeep, "K")
+	clientDel := h.app(projDel)
+	clientKeep := h.app(projKeep)
+	userDel := h.user(orgDel)
+	userKeep := h.user(orgKeep)
+
+	victim := h.token(clientDel, userDel.ID, nil)
+	survivor := h.token(clientKeep, userKeep.ID, nil)
+
+	rec := httptest.NewRecorder()
+	srv.deleteOrg(rec, adminReq(t, map[string]string{"orgID": orgDel.ID}, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("deleteOrg: status=%d body=%s, want 204", rec.Code, rec.Body.String())
+	}
+	h.mustGone("delete-org", victim)
+	h.mustAlive("delete-org", survivor)
+	if _, err := st.GetOrg(context.Background(), orgDel.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted org still present: err=%v, want ErrNotFound", err)
+	}
+
+	// Error path: deleting a non-existent org must report a non-2xx error and
+	// must not revoke the surviving org's tokens. RevokeOrgTokens runs first and
+	// matches no users, then DeleteOrg fails with ErrNotFound.
+	rec = httptest.NewRecorder()
+	srv.deleteOrg(rec, adminReq(t, map[string]string{"orgID": uuid.NewString()}, nil))
+	if rec.Code >= 200 && rec.Code < 300 {
+		t.Fatalf("deleteOrg on a missing org: status=%d, want a non-2xx error", rec.Code)
+	}
+	h.mustAlive("delete-missing-org", survivor)
+}
+
 // --- test helper ------------------------------------------------------------
 
 type revHelper struct {
