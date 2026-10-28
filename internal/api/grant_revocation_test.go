@@ -309,6 +309,54 @@ func TestDeleteAppHandlerRevokesOnlyThatAppsTokens(t *testing.T) {
 	h.mustAlive("delete-missing-app", keep)
 }
 
+func TestLogoutUserRevokesUserAcrossClientsOnly(t *testing.T) {
+	st, pool := revocationTestStore(t)
+	srv := &Server{store: st}
+	h := newRevHelper(t, st, pool)
+
+	// Force-logout (logoutUser -> RevokeUserTokens) must revoke the target
+	// user's tokens on every client, leave other users untouched, and never
+	// cross into another tenant. This is distinct from OIDC end-session
+	// (TerminateTokens), whose per-user+client scope is pinned in the store
+	// package (TestTerminateTokensScopedToUserAndClient); it is not repeated
+	// here.
+	org := h.org("org")
+	other := h.org("other-tenant")
+	proj := h.project(org, "P")
+	client1 := h.app(proj)
+	client2 := h.app(proj) // second client in the same project
+	projOther := h.project(other, "O")
+	clientOther := h.app(projOther)
+
+	userA := h.user(org)
+	userB := h.user(org)
+	userC := h.user(other)
+
+	// userA holds tokens on two different clients; both must go.
+	a1 := h.token(client1, userA.ID, nil)
+	a2 := h.token(client2, userA.ID, nil)
+	b := h.token(client1, userB.ID, nil)     // same tenant, other user
+	c := h.token(clientOther, userC.ID, nil) // other tenant
+
+	rec := httptest.NewRecorder()
+	srv.logoutUser(rec, adminReq(t, map[string]string{"userID": userA.ID}, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("logoutUser: status=%d body=%s, want 204", rec.Code, rec.Body.String())
+	}
+	h.mustGone("logout", a1, a2)
+	h.mustAlive("logout", b, c)
+
+	// Error path: logging out a missing user fails at the lookup and revokes
+	// nothing.
+	keep := h.token(client1, userB.ID, nil)
+	rec = httptest.NewRecorder()
+	srv.logoutUser(rec, adminReq(t, map[string]string{"userID": uuid.NewString()}, nil))
+	if rec.Code >= 200 && rec.Code < 300 {
+		t.Fatalf("logoutUser on a missing user: status=%d, want a non-2xx error", rec.Code)
+	}
+	h.mustAlive("logout-missing", keep)
+}
+
 // --- test helper ------------------------------------------------------------
 
 type revHelper struct {
