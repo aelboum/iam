@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aelboum/iam/internal/authn"
 	"github.com/aelboum/iam/internal/db"
+	"github.com/aelboum/iam/internal/ratelimit"
+	"github.com/aelboum/iam/internal/secret"
 	"github.com/aelboum/iam/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -176,6 +179,47 @@ func TestUserLockAndDeleteRevokeOnlyThatUsersTokens(t *testing.T) {
 	}
 	if !h.alive(keep) {
 		t.Error("error path: a failed delete must not revoke any tokens")
+	}
+}
+
+func TestSetPasswordHandlerRevokesOnlyTargetUser(t *testing.T) {
+	st, pool := revocationTestStore(t)
+	svc := authn.NewService(st, secret.NewBox([32]byte{23}), authn.Config{
+		Limits:          ratelimit.Memory,
+		SessionLifetime: time.Hour,
+		MaxFailedLogins: 5,
+		HashWaitTimeout: time.Second,
+		OrgLoginLimit:   1000,
+	})
+	srv := &Server{store: st, authn: svc}
+	h := newRevHelper(t, st, pool)
+
+	org := h.org("org")
+	proj := h.project(org, "P")
+	client := h.app(proj)
+	userA := h.user(org)
+	userB := h.user(org)
+
+	a := h.token(client, userA.ID, nil)
+	b := h.token(client, userB.ID, nil)
+	rec := httptest.NewRecorder()
+	// The new password must not contain the username or email.
+	srv.setPassword(rec, adminReq(t, map[string]string{"userID": userA.ID}, map[string]any{"password": "Str0ng-Passphrase-Qw7"}))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("setPassword: status=%d body=%s, want 204", rec.Code, rec.Body.String())
+	}
+	h.mustGone("setPassword", a)
+	h.mustAlive("setPassword", b)
+
+	// Error path: an invalid password is rejected and revokes nothing.
+	keepA := h.token(client, userA.ID, nil)
+	rec = httptest.NewRecorder()
+	srv.setPassword(rec, adminReq(t, map[string]string{"userID": userA.ID}, map[string]any{"password": "short"}))
+	if rec.Code >= 200 && rec.Code < 300 {
+		t.Fatalf("setPassword with a weak password: status=%d, want a non-2xx error", rec.Code)
+	}
+	if !h.alive(keepA) {
+		t.Error("error path: a rejected password change must not revoke any tokens")
 	}
 }
 
