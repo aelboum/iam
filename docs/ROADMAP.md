@@ -84,18 +84,24 @@ against disposable Postgres 16; `-race` remains CI-only here.
   (`access_token_type=jwt`), validated by signature without introspection, is not
   reflected until it expires; the bound is the access-token TTL plus the eager
   refresh-family revocation — the standard short-lived-JWT tradeoff.
-  **Recommended follow-up (not done):** an `internal/api` test asserting the
-  handlers call `RevokeProjectTokens`, to guard the wiring the store-level test
-  cannot see.
-- **Handler revocation wiring (PR #6, `3008d53`/`7084fb9`, unpushed).** The
-  `internal/api` guards now cover the handler->store token-revocation wiring the
-  store tests cannot see: `updateProjectGrant`/`deleteProjectGrant` (org+project
-  scoped, other tenant/project survive), `lockUser`/`deleteUser` (only that
-  user), `setPassword` (admin: revokes target only; weak password → non-2xx, no
-  revoke), and the self-service reset path `ConfirmPasswordReset` (authn-level —
-  **atomic in `CompletePasswordReset`'s transaction**: access+refresh tokens,
-  sessions and password_resets dropped together; another user untouched; a bad
-  token revokes nothing). Established invariant: federation login
+  **Recommended follow-up — now done** (see the next bullet): the `internal/api`
+  handler-wiring test asserting the handlers call `RevokeProjectTokens` was added
+  in `3008d53`, closing the gap the store-level test could not see.
+- **Handler revocation wiring (PR #6, `3008d53`/`7084fb9`/`f291155`/`0866a5e`,
+  unpushed).** The `internal/api` guards now cover the handler->store
+  token-revocation wiring the store tests cannot see: `updateProjectGrant`/
+  `deleteProjectGrant` (org+project scoped, other tenant/project survive),
+  `lockUser`/`deleteUser` (only that user), `setPassword` (admin: revokes target
+  only; weak password → non-2xx, no revoke), and the self-service reset path
+  `ConfirmPasswordReset` (authn-level — **atomic in `CompletePasswordReset`'s
+  transaction**: access+refresh tokens, sessions and password_resets dropped
+  together; another user untouched; a bad token revokes nothing). `deleteApp`
+  (`f291155`) revokes only the deleted app's client tokens — a sibling app in the
+  same project and an app in another tenant survive, and a missing app fails at
+  the owner lookup before any revoke. `logoutUser` (`0866a5e`, force-logout via
+  `RevokeUserTokens`) revokes the target user across every client while other
+  users and other tenants stay intact — distinct from OIDC end-session
+  (`TerminateTokens`, per user+client). Established invariant: federation login
   (`RedeemFederatedLogin`) and SSO account-linking (`LinkIdentity`) deliberately
   **preserve** existing sessions and carry no revocation. All guards only.
 - **Org deletion token revocation (PR #6, unpushed).** `deleteOrg` revokes
