@@ -181,7 +181,8 @@ session; authorize-layer refusal, with the engine's strict-`iss` backstop covere
 offline unit tests). Remaining gates before GO: the rest of the WS9 staging rehearsal
 — migration-recovery and backup-restore run **on staging** with a measured, recorded
 recovery time, plus staging-config sign-off — completed with retained evidence; an
-external penetration test completed with retained evidence; and all residual risks in
+external penetration test — **waived by the owner (2026-10-28), risk accepted**
+(SECURITY.md register W1), so no longer a blocking gate; and all residual risks in
 SECURITY.md remaining accepted. (The WS6 supported-scope decision is resolved below:
 MSA excluded from the initial release.) Code readiness and staging readiness are
 tracked separately above.
@@ -214,19 +215,22 @@ Authoritative status as of commit `1d48e51` (CI `test`/`e2e`/`security` green).
 | 9 | Live IdP flows + negative cases evidenced | **PASS** | WS5/WS7; Google + Entra over HTTPS staging |
 | 10 | Cross-tenant rejection verified | **PASS (with caveat)** | Live refusal at the authorize layer; engine strict-`iss` via offline tests (SECURITY.md) |
 | 11 | Secret/key/bootstrap-admin lifecycle reviewed | **PASS (follow-up)** | SECURITY.md; bootstrap-admin rotation is a documented production follow-up |
-| 12 | Independent external penetration test completed | **NOT PERFORMED — INDEPENDENT TESTING NOT AVAILABLE** | No independent engagement initiated; internal and AI-assisted audits are explicitly **not** a substitute (PENTEST.md). External authorization required. Tester selection and proposal scoring: PENTEST_VENDOR_SELECTION.md. |
+| 12 | Independent external penetration test completed | **NOT PERFORMED — WAIVED (risk accepted by owner, 2026-10-28)** | No independent engagement performed; the owner has deliberately waived this gate and accepted the risk — see SECURITY.md "Waived gate" entry (register W1). This is a waiver, **not** a pass; internal and AI-assisted audits remain explicitly **not** a substitute (PENTEST.md). Tester selection/brief retained should the owner reverse: PENTEST_VENDOR_SELECTION.md. |
 | 13 | Operational monitoring / IR / recovery documented | **PASS** | OPERATIONS.md, DEPLOYMENT.md (WS8) |
 | 14 | Every exception/residual risk explicit and reviewed | **PASS** | SECURITY.md residual register N1–N20 |
 | 15 | Final code, docs, migrations, config, CI agree | **PASS** | Reconciled; CI green on `1d48e51` |
 
-**Overall: `BLOCKED — EXTERNAL AUTHORIZATION REQUIRED`.** Every technical gate that can
-be satisfied internally has passed with evidence on `1d48e51`. The one remaining mandatory
-gate is **criterion 12 — an independent external penetration test**, which requires separate
-operator authorization and an independent tester; until it is completed (with remediation and
-retest) production stays **NO-GO**. Production hardening follow-ups (stable DNS instead of the
-ephemeral tunnel, a managed secret store, DB TLS, bootstrap-admin rotation) are to be applied
-at deploy time (step-by-step runbook with verification and rollback:
-[DEPLOY_HARDENING.md](DEPLOY_HARDENING.md)) and do not block the pentest.
+**Overall: `NO-GO — PENDING OWNER RELEASE AUTHORIZATION`.** Every technical gate that can
+be satisfied internally has passed with evidence on `1d48e51`. The one mandatory gate that
+cannot be satisfied internally — **criterion 12, an independent external penetration test** —
+has been **waived by the owner** (2026-10-28), who formally accepted the risk of releasing
+without it (SECURITY.md, register W1 and the "Waived gate" subsection); it is recorded as
+**NOT PERFORMED — WAIVED**, not passed, and internal/AI-assisted testing is still not
+represented as equivalent. With that gate waived, no *technical* gate remains blocking, but
+production stays **NO-GO** until the owner **explicitly authorizes release** and the production
+hardening follow-ups (stable DNS instead of the ephemeral tunnel, a managed secret store, DB
+TLS, bootstrap-admin rotation — step-by-step runbook with verification and rollback:
+[DEPLOY_HARDENING.md](DEPLOY_HARDENING.md)) are applied at deploy time.
 
 An internal security audit (2026-10-27) — two independent reviews, every finding
 verified against the code — fixed four lower-severity issues (OIDC auth-request

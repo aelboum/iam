@@ -169,8 +169,44 @@ and roles stay confined to the owning project — all enforced by `features_test
 | N18 | A granted org can read the project's `owner_org_id` | Informational | Minor cross-tenant metadata exposure | The grant is an intentional relationship between the two orgs | **Accepted.** Owner: maintainer. |
 | N19 | Refused cross-tenant attempts are not separately audited; a trust-policy change does not end already-issued federated sessions | Informational | Reduced forensic signal; a trust downgrade applies only to new sessions (≤15-min TTL) | Refusals return 403/404; sessions are short-lived | **Accepted.** Owner: maintainer. |
 | N20 | `updateProjectGrant` / `deleteProjectGrant` (owner path) require the project owner, while `createProjectGrant` requires an instance admin | Low (by design) | A vendor org adjusts the role set of an existing grant to its own project without instance-admin review | Roles confined to the owning project's defined roles; the granted org cannot modify its grant (403); an unrelated org cannot (404); creating a cross-org grant still needs an instance admin | **Accepted (Option A, 2026-10-27).** Deliberate: *creating* a grant establishes a cross-tenant relationship (operator-gated), while adjusting an *existing* grant's role set is the owner configuring its own project. Boundaries enforced by `features_test.py`. Owner: maintainer. |
+| W1 | Independent external penetration test (readiness criterion 12) not performed | High (process) | No independent third party has adversarially tested the running system; classes of authentication, tenant-isolation and OAuth/OIDC flaws that internal code review and automated tooling can miss may remain undetected in production | Three internal code reviews (none open above Low), AI-assisted reviews, static analysis, `govulncheck`, `gitleaks`, and CI (`test`/`-race`/`e2e`/`security`) — explicitly **not** equivalent to an independent external penetration test | **Accepted — WAIVED by owner (2026-10-28).** Criterion 12 remains **NOT PERFORMED**; the owner has deliberately accepted the risk of releasing without an independent external test. This is a waiver, not a pass. See the "Waived gate" subsection below. Owner: aelboum (repository owner / operator). |
 
 Review this register whenever dependencies, migrations, or the trust model change.
+
+## Waived gate — independent external penetration test (criterion 12)
+
+The owner has elected **not** to commission an independent external penetration
+test and to **waive** production-readiness criterion 12 (see ROADMAP.md),
+formally accepting the associated risk.
+
+- **Decision.** Release may proceed without an independent external penetration
+  test. Criterion 12 is recorded as **NOT PERFORMED — WAIVED**; it is *not*
+  marked passed, and nothing in this repository represents internal or automated
+  testing as equivalent to an independent external test.
+- **Decision owner / date.** aelboum (repository owner / operator), 2026-10-28.
+- **Residual risk accepted (register W1).** No independent third party has
+  adversarially tested the running system. Internal code review and automated
+  tooling can miss whole classes of findings — authentication and lockout
+  bypasses, cross-tenant access, OAuth/OIDC code/redirect/token handling,
+  federation and SSRF, and business-logic flaws — that an independent tester is
+  more likely to surface. These may remain undetected in production. The risk is
+  heightened because IAM is intended to replace an established identity provider
+  for live tenants.
+- **Compensating controls (not a substitute).** Three internal code reviews with
+  no finding open above Low, AI-assisted reviews, static analysis, `govulncheck`
+  and `gitleaks`, and CI (`test` incl. `-race`, `e2e`, `security`). An optional
+  internal AI-pentest tool may be run against a disposable target as additional
+  internal assurance; it is likewise **not** equivalent to an independent test.
+- **Re-evaluation triggers.** Revisit this waiver — i.e. reconsider commissioning
+  an independent external test — before widening scope (for example adding
+  personal-Microsoft-account support), on any material change to the
+  authentication, tenant-isolation, token, or federation code, or after a
+  security incident.
+
+This waiver removes the *external-testing* blocker by the owner's acceptance of
+risk; it does not by itself authorize release. Production stays **NO-GO** until
+the owner **explicitly authorizes release** and the deploy-time hardening
+follow-ups ([DEPLOY_HARDENING.md](DEPLOY_HARDENING.md)) are applied.
 
 ## Automated security evidence
 
