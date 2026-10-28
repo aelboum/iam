@@ -42,6 +42,52 @@ fixed in `8b438c9`, two kept for consistency with existing conventions).
 | e2e smoke/feature suites | **NOT RUN this session** | Require a running engine + Python `cryptography`; CI job `e2e` covers them. | Re-run via CI when pushed, or locally against a disposable engine. | partial |
 | Independent penetration test | **NOT PERFORMED** | Unchanged by this work. Internal AI review, unit/integration tests, `govulncheck`, `gitleaks` and successful CI do **not** substitute for it. | Commission an independent external tester (PENTEST.md); separate authorization. Production remains **NO-GO** while this gate is open. | **no** |
 
+## Tenant isolation & authorization audit (code readiness, 2026-10-28)
+
+Read-only audit of the multi-tenant authorization boundary, plus **test-only**
+regression guards. On local branches off `main` (`0ac28ee`), each its own draft
+PR awaiting the operator's merge decision — **no production code changed; merges
+not authorized**. Validated with Go 1.27.3 (`gofmt`, `go vet`, package tests)
+against disposable Postgres 16; `-race` remains CI-only here.
+
+- **Session scope (PR #6, `68ff1b1`).** A session presented with another org's
+  id is rejected (`ErrSessionInvalid`) on every path; `loadSession` already
+  enforces it. Guard only.
+- **AvailableRoles (PR #6, `d19de5c`).** Project roles are offered only to the
+  owning org or an org holding an explicit project grant; any other org gets
+  `ok=false` and no roles. Guard only.
+- **EffectiveRoles (PR #6, `a942acd`, unpushed).** A user's effective roles are
+  the intersection of their assigned roles and what their org may currently hand
+  out, recomputed at read time — so narrowing or revoking the org's project grant
+  drops roles on the next resolution without rewriting each `user_grant` row.
+  Inspected chain: `api.userForCaller`→`canAccessOrg` blocks cross-org user ids
+  (404, no existence leak); `CreateUserGrant`/`UpdateUserGrant` enforce roleKeys ⊆
+  `AvailableRoles(user.OrgID)`; OIDC `checkUserCanUseClient`→app project→
+  `AvailableRoles`; `tokenProject` returns the app's own project (scope cannot
+  override); machine project-scope validated in `ClientCredentialsTokenRequest`.
+  No defect; guard only.
+- **Project-grant token revocation (PR #6, `d2a5250`, unpushed).** Research
+  question: can already-issued access tokens outlive a narrowed/removed grant?
+  **No defect — intended and safe by three independent layers.** (1) The API
+  handlers `updateProjectGrant`/`deleteProjectGrant` follow the grant change with
+  `store.RevokeProjectTokens(projectID, grantedOrgID)`, which deletes the org's
+  access **and** refresh tokens for the project's apps and any machine tokens
+  carrying the project scope, scoped to exactly that org+project. (2) Bearer-token
+  introspection (`SetIntrospectionFromToken`) re-runs `checkUserCanUseProject`, so
+  a revoked grant reports the token **inactive immediately** and a narrowed grant
+  yields reduced roles via a live `EffectiveRoles` recomputation — independent of
+  whether the row was deleted. (3) Access-token TTL is short (5m default) and the
+  refresh family is revoked, so no fresh token is minted. Regression guard
+  `TestProjectGrantChangeRevokesTokens` pins the scoping (a second tenant's tokens
+  for the same project and the same tenant's tokens for another project survive).
+  **Accepted limitation (not a defect):** a *self-contained JWT* access token
+  (`access_token_type=jwt`), validated by signature without introspection, is not
+  reflected until it expires; the bound is the access-token TTL plus the eager
+  refresh-family revocation — the standard short-lived-JWT tradeoff.
+  **Recommended follow-up (not done):** an `internal/api` test asserting the
+  handlers call `RevokeProjectTokens`, to guard the wiring the store-level test
+  cannot see.
+
 ## Required external prerequisites (the only items blocking the remaining work)
 
 To unblock WS5–7 (and therefore WS9), the following **non-production** registrations
