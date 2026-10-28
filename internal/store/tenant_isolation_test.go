@@ -2,9 +2,11 @@ package store
 
 import (
 	"context"
+	"errors"
 	"os"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/aelboum/iam/internal/db"
 	"github.com/google/uuid"
@@ -198,6 +200,198 @@ func TestEffectiveRolesIntersectsWithOrgGrant(t *testing.T) {
 	}
 	if len(roles) != 0 {
 		t.Fatalf("effective roles after revoke = %v, want none (org lost all access)", roles)
+	}
+}
+
+// TestProjectGrantChangeRevokesTokens guards that changing or revoking an org's
+// project grant takes effect on already-issued access and refresh tokens, and
+// that the revocation is scoped to exactly the affected org and project.
+//
+// The grant-change store methods (UpdateProjectGrant/DeleteProjectGrant) do not
+// themselves delete tokens; the API handlers follow each with
+// RevokeProjectTokens(projectID, grantedOrgID). This test exercises that
+// handler sequence at the store level and asserts the scoping of
+// RevokeProjectTokens, which matches tokens by two paths (projectTokenCond):
+// tokens issued to the project's apps, and machine-user tokens carrying the
+// project scope. It must revoke only the targeted org's tokens for the targeted
+// project, leaving another tenant's tokens for the same project and the same
+// tenant's tokens for a different project untouched. Needs IAM_TEST_DATABASE_URL.
+func TestProjectGrantChangeRevokesTokens(t *testing.T) {
+	url := os.Getenv("IAM_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("set IAM_TEST_DATABASE_URL to a disposable database to run this test")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer pool.Close()
+	if err := db.Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	st := New(pool)
+
+	mkOrg := func(p string) *Org {
+		o, err := st.CreateOrg(ctx, p+"-"+uuid.NewString(), p+"-"+uuid.NewString())
+		if err != nil {
+			t.Fatalf("create org %s: %v", p, err)
+		}
+		t.Cleanup(func() { pool.Exec(ctx, `DELETE FROM orgs WHERE id = $1`, o.ID) })
+		return o
+	}
+	mkUser := func(org *Org) *User {
+		u, err := st.CreateUser(ctx, NewUser{
+			OrgID: org.ID, Username: "u-" + uuid.NewString(), Email: uuid.NewString() + "@t.test",
+		})
+		if err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+		return u
+	}
+	// mkToken stores an access token and a paired refresh token for a subject on
+	// a client/scope set, and returns their ids so the test can check both.
+	mkToken := func(clientID, subject string, scopes []string) (atID, rtID string) {
+		if scopes == nil {
+			scopes = []string{}
+		}
+		atID, rtID = uuid.NewString(), uuid.NewString()
+		at := &AccessToken{
+			ID: atID, ClientID: clientID, Subject: subject, Audience: []string{clientID},
+			Scopes: scopes, RefreshTokenID: &rtID, ExpiresAt: time.Now().Add(time.Hour),
+		}
+		rt := &RefreshToken{
+			ID: rtID, TokenHash: uuid.NewString(), ClientID: clientID, Subject: subject,
+			Audience: []string{clientID}, Scopes: scopes, AMR: []string{}, AuthTime: time.Now(),
+			AccessTokenID: &atID, ExpiresAt: time.Now().Add(24 * time.Hour), FamilyID: uuid.NewString(),
+		}
+		if err := st.CreateTokens(ctx, at, rt); err != nil {
+			t.Fatalf("create tokens: %v", err)
+		}
+		return atID, rtID
+	}
+	alive := func(atID, rtID string) bool {
+		_, aerr := st.GetAccessToken(ctx, atID)
+		_, rerr := st.GetRefreshTokenByID(ctx, rtID)
+		switch {
+		case aerr == nil && rerr == nil:
+			return true
+		case errors.Is(aerr, ErrNotFound) && errors.Is(rerr, ErrNotFound):
+			return false
+		default:
+			t.Fatalf("inconsistent token state: access err=%v refresh err=%v", aerr, rerr)
+			return false
+		}
+	}
+
+	owner := mkOrg("owner")
+	tenantX := mkOrg("tenant-x")
+	tenantY := mkOrg("tenant-y")
+
+	// Project P (with app P-app) and project Q (with app Q-app), both owned by owner.
+	projP, err := st.CreateProject(ctx, owner.ID, "proj-P")
+	if err != nil {
+		t.Fatalf("create project P: %v", err)
+	}
+	projQ, err := st.CreateProject(ctx, owner.ID, "proj-Q")
+	if err != nil {
+		t.Fatalf("create project Q: %v", err)
+	}
+	for _, p := range []*Project{projP, projQ} {
+		if err := st.AddRole(ctx, p.ID, Role{Key: "viewer", DisplayName: "Viewer"}); err != nil {
+			t.Fatalf("add role on %s: %v", p.ID, err)
+		}
+	}
+	clientP := "client-P-" + uuid.NewString()
+	if _, err := st.CreateApp(ctx, App{
+		ProjectID: projP.ID, Name: "P-app", ClientID: clientP, AppType: "web",
+		AuthMethod: "none", AccessTokenType: "bearer",
+		RedirectURIs: []string{}, PostLogoutRedirectURIs: []string{},
+	}); err != nil {
+		t.Fatalf("create app P: %v", err)
+	}
+	clientQ := "client-Q-" + uuid.NewString()
+	if _, err := st.CreateApp(ctx, App{
+		ProjectID: projQ.ID, Name: "Q-app", ClientID: clientQ, AppType: "web",
+		AuthMethod: "none", AccessTokenType: "bearer",
+		RedirectURIs: []string{}, PostLogoutRedirectURIs: []string{},
+	}); err != nil {
+		t.Fatalf("create app Q: %v", err)
+	}
+
+	// Both tenants are granted P; tenant X is also granted Q.
+	grantXP, err := st.CreateProjectGrant(ctx, projP.ID, tenantX.ID, []string{"viewer"})
+	if err != nil {
+		t.Fatalf("grant X on P: %v", err)
+	}
+	if _, err := st.CreateProjectGrant(ctx, projP.ID, tenantY.ID, []string{"viewer"}); err != nil {
+		t.Fatalf("grant Y on P: %v", err)
+	}
+	if _, err := st.CreateProjectGrant(ctx, projQ.ID, tenantX.ID, []string{"viewer"}); err != nil {
+		t.Fatalf("grant X on Q: %v", err)
+	}
+
+	userX := mkUser(tenantX)
+	userY := mkUser(tenantY)
+
+	// issueTokens (re)creates the four tokens the scoping assertions track.
+	type tok struct{ at, rt string }
+	var xpApp, xpScope, ypApp, xqApp tok
+	issue := func() {
+		// tenant X, project P: one via the app client, one via the project scope
+		// (machine-user shape: a client id that is not an app, scope carries P).
+		xpApp.at, xpApp.rt = mkToken(clientP, userX.ID, nil)
+		xpScope.at, xpScope.rt = mkToken("machine-"+uuid.NewString(), userX.ID,
+			[]string{"urn:iam:project:" + projP.ID})
+		// tenant Y, project P (same project, different org): must survive.
+		ypApp.at, ypApp.rt = mkToken(clientP, userY.ID, nil)
+		// tenant X, project Q (same org, different project): must survive.
+		xqApp.at, xqApp.rt = mkToken(clientQ, userX.ID, nil)
+	}
+
+	// Phase 1: narrowing tenant X's P grant, as updateProjectGrant does.
+	issue()
+	if !alive(xpApp.at, xpApp.rt) || !alive(xpScope.at, xpScope.rt) {
+		t.Fatal("precondition: tenant X P tokens should exist before the change")
+	}
+	if _, err := st.UpdateProjectGrant(ctx, grantXP.ID, []string{}); err != nil {
+		t.Fatalf("narrow grant X on P: %v", err)
+	}
+	if err := st.RevokeProjectTokens(ctx, projP.ID, tenantX.ID); err != nil {
+		t.Fatalf("revoke after narrow: %v", err)
+	}
+	if alive(xpApp.at, xpApp.rt) {
+		t.Error("narrow: tenant X's app token for P should be revoked")
+	}
+	if alive(xpScope.at, xpScope.rt) {
+		t.Error("narrow: tenant X's project-scope token for P should be revoked")
+	}
+	if !alive(ypApp.at, ypApp.rt) {
+		t.Error("narrow: tenant Y's token for P must survive (different org)")
+	}
+	if !alive(xqApp.at, xqApp.rt) {
+		t.Error("narrow: tenant X's token for Q must survive (different project)")
+	}
+
+	// Phase 2: deleting tenant X's P grant, as deleteProjectGrant does.
+	issue()
+	if err := st.DeleteProjectGrant(ctx, grantXP.ID); err != nil {
+		t.Fatalf("delete grant X on P: %v", err)
+	}
+	if err := st.RevokeProjectTokens(ctx, projP.ID, tenantX.ID); err != nil {
+		t.Fatalf("revoke after delete: %v", err)
+	}
+	if alive(xpApp.at, xpApp.rt) {
+		t.Error("delete: tenant X's app token for P should be revoked")
+	}
+	if alive(xpScope.at, xpScope.rt) {
+		t.Error("delete: tenant X's project-scope token for P should be revoked")
+	}
+	if !alive(ypApp.at, ypApp.rt) {
+		t.Error("delete: tenant Y's token for P must survive (different org)")
+	}
+	if !alive(xqApp.at, xqApp.rt) {
+		t.Error("delete: tenant X's token for Q must survive (different project)")
 	}
 }
 
