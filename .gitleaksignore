@@ -9,3 +9,8 @@
 # detection of any other secret.
 48ad1b4a667bfd2d74de906dff3a2c4cb0e06acd:scripts/features_test.py:generic-api-key:423
 f73d34df3b5b92a584514f6f2e7fff6db872a545:scripts/features_test.py:generic-api-key:423
+# Same false positive in the handler-wiring test's synthetic set-password
+# fixture (not a credential to any system); the value was lowered to the same
+# convention going forward, and this entry suppresses the already-published
+# commit that carried the higher-entropy value (it cannot be rewritten).
+7084fb97b00b9c4225d744fa0125ad2523f071bd:internal/api/grant_revocation_test.go:generic-api-key:207
