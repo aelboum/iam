@@ -214,7 +214,7 @@ Authoritative status as of commit `1d48e51` (CI `test`/`e2e`/`security` green).
 | 9 | Live IdP flows + negative cases evidenced | **PASS** | WS5/WS7; Google + Entra over HTTPS staging |
 | 10 | Cross-tenant rejection verified | **PASS (with caveat)** | Live refusal at the authorize layer; engine strict-`iss` via offline tests (SECURITY.md) |
 | 11 | Secret/key/bootstrap-admin lifecycle reviewed | **PASS (follow-up)** | SECURITY.md; bootstrap-admin rotation is a documented production follow-up |
-| 12 | Independent external penetration test completed | **NOT PERFORMED — INDEPENDENT TESTING NOT AVAILABLE** | No independent engagement initiated; internal and AI-assisted audits are explicitly **not** a substitute (PENTEST.md). External authorization required. |
+| 12 | Independent external penetration test completed | **NOT PERFORMED — INDEPENDENT TESTING NOT AVAILABLE** | No independent engagement initiated; internal and AI-assisted audits are explicitly **not** a substitute (PENTEST.md). External authorization required. Tester selection and proposal scoring: PENTEST_VENDOR_SELECTION.md. |
 | 13 | Operational monitoring / IR / recovery documented | **PASS** | OPERATIONS.md, DEPLOYMENT.md (WS8) |
 | 14 | Every exception/residual risk explicit and reviewed | **PASS** | SECURITY.md residual register N1–N20 |
 | 15 | Final code, docs, migrations, config, CI agree | **PASS** | Reconciled; CI green on `1d48e51` |
@@ -225,7 +225,8 @@ gate is **criterion 12 — an independent external penetration test**, which req
 operator authorization and an independent tester; until it is completed (with remediation and
 retest) production stays **NO-GO**. Production hardening follow-ups (stable DNS instead of the
 ephemeral tunnel, a managed secret store, DB TLS, bootstrap-admin rotation) are to be applied
-at deploy time and do not block the pentest.
+at deploy time (step-by-step runbook with verification and rollback:
+[DEPLOY_HARDENING.md](DEPLOY_HARDENING.md)) and do not block the pentest.
 
 An internal security audit (2026-10-27) — two independent reviews, every finding
 verified against the code — fixed four lower-severity issues (OIDC auth-request

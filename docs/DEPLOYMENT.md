@@ -229,5 +229,16 @@ for a real environment remain the runbook items described above.
 
 ## Before real customer data
 
+Apply the production deploy-time hardening follow-ups — stable DNS, a managed
+secret store, database TLS, and bootstrap-admin rotation — using the step-by-step
+runbook in [DEPLOY_HARDENING.md](DEPLOY_HARDENING.md), which carries verification
+and rollback for each.
+
 Commission an external penetration test. [PENTEST.md](PENTEST.md) is a scope
-brief you can hand to the tester.
+brief you can hand to the tester;
+[PENTEST_ENGAGEMENT_BRIEF.md](PENTEST_ENGAGEMENT_BRIEF.md) is a ready-to-send
+request for proposal, and [PENTEST_VENDOR_SELECTION.md](PENTEST_VENDOR_SELECTION.md)
+helps you shortlist testers and score their proposals. The hardening follow-ups
+do not block the penetration test, and neither hardening nor any internal review
+is a substitute for it: production stays **NO-GO** until the independent test is
+completed with evidence and release is explicitly authorized.
