@@ -91,9 +91,16 @@ func (s *Storage) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest, 
 		}
 	}
 	r := &store.AuthRequest{
-		ID:                  uuid.NewString(),
-		ClientID:            req.ClientID,
-		RedirectURI:         req.RedirectURI,
+		ID:          uuid.NewString(),
+		ClientID:    req.ClientID,
+		RedirectURI: req.RedirectURI,
+		// State is the relying party's CSRF token. Per RFC 6749 §10.12 the OP
+		// echoes it back to the client unchanged; binding state to the end
+		// user's browser session is the relying party's responsibility, not the
+		// provider's, and provider-side binding is neither required nor
+		// sufficient for the client's CSRF defence. Where IAM is itself the RP
+		// (federation) it does bind the browser, see internal/authn/federation.go.
+		// See docs/SECURITY.md ("Integrator responsibility — OAuth state").
 		State:               req.State,
 		Nonce:               req.Nonce,
 		Scopes:              req.Scopes,

@@ -30,7 +30,7 @@ does **not** substitute for the live-provider and staging validation tracked in
 |------|-----------------|-----------------|
 | Authentication & account recovery | Credential stuffing, enumeration, reset-token abuse | Per-factor lockout (`internal/store/users.go:196-212`); unknown-user path matches real failure incl. hashing time (`internal/authn/authn.go:424`); reset tokens single-use/30 min, cooldown looks like unknown user (`internal/store/email.go:88-133`), invalidated on credential/lock change (M12). |
 | Session & token lifecycle | Token replay, non-revocation | Opaque access tokens + refresh family; revoke by subject/org/app/project (`internal/store/oidc.go:206-248`); refresh rotation CAS (`:259-265`). |
-| OIDC auth-code + PKCE | Code interception, CSRF | Standard auth-code with PKCE and state; engine-as-OP via zitadel/oidc `op`. |
+| OIDC auth-code + PKCE | Code interception, CSRF | Standard auth-code with PKCE and state; engine-as-OP via zitadel/oidc `op`. The `state` CSRF token is echoed verbatim per RFC 6749 §10.12; binding it to the end user's browser session is the relying party's responsibility (see "Integrator responsibility" below). |
 | Federation & identity linking | Login CSRF, intent replay, email-based takeover | Browser binding required (`internal/authn/federation.go:111,275-279`), intent burned on redeem even on mismatch (`internal/store/idp.go:173`); identity keyed on `(idp_id, sub)` never email (`federation.go:205-210`); email link only with instance `trust_email`+`link_by_email` (`internal/api/orgs.go:294`). |
 | MFA & passkeys | MFA bypass, passkey clone/replay/enumeration | `amr: fed` is not MFA; federated login satisfies MFA only if `trust_mfa` set (`authn.go:581`); passkey challenge expiry (`authn/passkeys.go:181,223-227`), counter-must-grow CAS (`store/passkeys.go:46-52`), clone regression reject (`authn/passkeys.go:201`), no credential-ID disclosure; RP settings validated at boot (`:234`). |
 | Machine users & project scopes | Scope escalation | Only one `urn:iam:project:<uuid>` scope; unsupported/extra/invalid scopes rejected `invalid_scope` (`internal/oidcop/storage.go:598-616`); grant removal revokes tokens (L5). |
@@ -207,6 +207,24 @@ This waiver removes the *external-testing* blocker by the owner's acceptance of
 risk; it does not by itself authorize release. Production stays **NO-GO** until
 the owner **explicitly authorizes release** and the deploy-time hardening
 follow-ups ([DEPLOY_HARDENING.md](DEPLOY_HARDENING.md)) are applied.
+
+## Integrator responsibility — OAuth `state` and login CSRF
+
+IAM is the OpenID Provider (OP). In the authorization-code flow the `state`
+parameter is the **relying party's** CSRF defence: the client generates it,
+binds it to the end user's browser session, and verifies it on the callback.
+Per RFC 6749 §10.12 the OP echoes `state` back unchanged and does not bind it to
+a browser session of its own — provider-side binding is neither required nor
+sufficient for the client's CSRF protection. Relying parties integrating with
+IAM **must** implement their own `state` (or PKCE) session binding and reject
+callbacks whose `state` does not match the one stored for that browser session.
+
+This split is deliberate and standard, and differs from federation, where IAM is
+itself the relying party to an upstream IdP and therefore *does* bind the flow
+to the browser (`browserBinding`, `internal/authn/federation.go`; see the
+Federation row above). An internal assurance review (2026-10-29) flagged the
+OP's lack of provider-side `state` binding; on review it was confirmed to be by
+design per the responsibility split above, not a defect.
 
 ## Automated security evidence
 

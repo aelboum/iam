@@ -160,6 +160,10 @@ func (s *Store) CompletePasswordReset(ctx context.Context, tokenHash, userID, pa
 		if tag.RowsAffected() == 0 {
 			return ErrNotFound
 		}
+		// NOT locked rejects a manually locked account only. An active temporary
+		// lockout (locked_until / mfa_locked_until) is left untouched on purpose
+		// so it keeps blocking at login (audit L3); only the password failure
+		// counter is cleared here. Guarded by password_reset_lockout_test.go.
 		tag, err = tx.Exec(ctx, `
 			UPDATE users SET password_hash = $2, failed_logins = 0, updated_at = now()
 			WHERE id = $1 AND NOT locked AND kind = $3`, userID, passwordHash, KindHuman)

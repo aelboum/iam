@@ -341,6 +341,13 @@ func (s *Service) ConfirmPasswordReset(ctx context.Context, c Client, token, pas
 	if err != nil {
 		return err
 	}
+	// A manual lock (user.Locked) blocks recovery outright; a temporary lockout
+	// (locked_until / mfa_locked_until) deliberately does not, so a user locked
+	// out by failed logins can still recover their account. This is not a
+	// lockout bypass: CompletePasswordReset leaves the temporary-lockout columns
+	// intact (audit L3) and CheckPassword re-checks IsLocked()/IsMFALocked(), so
+	// the new password cannot log in until the lockout expires. Guarded by
+	// internal/authn/password_reset_lockout_test.go.
 	if (c.OrgID != "" && c.OrgID != user.OrgID) || user.Locked || user.Kind != store.KindHuman {
 		return ErrInvalidCredentials
 	}
