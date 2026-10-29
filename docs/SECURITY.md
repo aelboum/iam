@@ -169,6 +169,14 @@ and roles stay confined to the owning project — all enforced by `features_test
 | N18 | A granted org can read the project's `owner_org_id` | Informational | Minor cross-tenant metadata exposure | The grant is an intentional relationship between the two orgs | **Accepted.** Owner: maintainer. |
 | N19 | Refused cross-tenant attempts are not separately audited; a trust-policy change does not end already-issued federated sessions | Informational | Reduced forensic signal; a trust downgrade applies only to new sessions (≤15-min TTL) | Refusals return 403/404; sessions are short-lived | **Accepted.** Owner: maintainer. |
 | N20 | `updateProjectGrant` / `deleteProjectGrant` (owner path) require the project owner, while `createProjectGrant` requires an instance admin | Low (by design) | A vendor org adjusts the role set of an existing grant to its own project without instance-admin review | Roles confined to the owning project's defined roles; the granted org cannot modify its grant (403); an unrelated org cannot (404); creating a cross-org grant still needs an instance admin | **Accepted (Option A, 2026-10-27).** Deliberate: *creating* a grant establishes a cross-tenant relationship (operator-gated), while adjusting an *existing* grant's role set is the owner configuring its own project. Boundaries enforced by `features_test.py`. Owner: maintainer. |
+| N21 | The periodic purge sequentially scanned six hot tables (no `expires_at` index) and `audit_events.at`; one failing table aborted the whole loop | Medium (availability) | Seconds of I/O every 10 min on the tables that grow fastest, on the same disks that serve logins | — | **Fixed (2026-10-29).** Migration `0008` adds the indexes and drops the superseded `users_org_id_username_key`; `PurgeExpired` continues past a failing table. Measured 133 ms → 31 ms at 200k rows, now proportional to expired rows. Owner: maintainer. |
+| N22 | Token, introspection, revocation and userinfo responses were cacheable (RFC 6749 §5.1 MUST) | Medium | A shared/browser cache can serve a token response after revocation | — | **Fixed (2026-10-29).** `noStore` middleware on exactly those paths. Owner: maintainer. |
+| N23 | TOTP enrollment codes were verifiable without any attempt cap | Low | A management key could brute-force a six-digit pending code and activate TOTP on a user whose secret nobody holds, locking them out of the second factor | — | **Fixed (2026-10-29).** Five attempts per enrollment (`users.totp_enroll_attempts`, reset on re-enroll), then 429. Owner: maintainer. |
+| N24 | No CORS at all: `OPTIONS` returned 405, so no browser SPA could call the API | Low (functional) | Browser-based integrators had to proxy | — | **Fixed (2026-10-29).** Opt-in `IAM_CORS_ORIGINS` (exact origins, https outside dev mode) + 204 preflight. Owner: maintainer. |
+| N25 | `userinfo` answers 403 with an empty body once the token is revoked, not 401 `invalid_token` | Low | Integrators that branch on 401 mis-handle revocation | Library behaviour; the token is refused either way | **Accepted.** Documented in the assessment report. Owner: maintainer. |
+| N26 | Quota checks are check-then-insert, so a concurrent burst can exceed a cap by a few rows | Low | Marginal over-quota, no security effect | Caps are 100k users / 100 projects / 50 keys / 50 apps / 200 roles / 10 IdPs | **Accepted.** Owner: maintainer. |
+| N27 | `/healthz` is unauthenticated, unthrottled and pings the database | Low | A flood consumes pool connections | Cheap query; container healthchecks are low-rate | **Accepted.** Owner: operator. |
+| N28 | `sessions.user_id::text` cast defeated the index on every credential change, lock, logout and delete | Medium (availability) | Full scan of `sessions`/`password_resets` per operation | — | **Fixed (2026-10-29).** Compared as `$1::uuid`; indexes added. Owner: maintainer. |
 | W1 | Independent external penetration test (readiness criterion 12) not performed | High (process) | No independent third party has adversarially tested the running system; classes of authentication, tenant-isolation and OAuth/OIDC flaws that internal code review and automated tooling can miss may remain undetected in production | Three internal code reviews (none open above Low), AI-assisted reviews, static analysis, `govulncheck`, `gitleaks`, and CI (`test`/`-race`/`e2e`/`security`) — explicitly **not** equivalent to an independent external penetration test | **Accepted — WAIVED by owner (2026-10-28).** Criterion 12 remains **NOT PERFORMED**; the owner has deliberately accepted the risk of releasing without an independent external test. This is a waiver, not a pass. See the "Waived gate" subsection below. Owner: aelboum (repository owner / operator). |
 
 Review this register whenever dependencies, migrations, or the trust model change.
@@ -228,9 +236,42 @@ design per the responsibility split above, not a defect.
 
 ## Automated security evidence
 
-- **`govulncheck ./...`**: 0 reachable vulnerabilities (only GO-2026-5932, unreachable). Run in CI (`security` job) and verified locally.
+- **`govulncheck ./...`**: 0 vulnerabilities, after the toolchain was pinned to
+  Go 1.27.3 (`toolchain` directive + pinned build image). At the assessed commit
+  the module pinned Go 1.26.10 and 12 standard-library vulnerabilities were
+  reachable (GO-2026-6599/6600/6603/6605/6607/6608/6610/6611/6612/6613/6617/6809).
 - **gitleaks** (full history): 0 leaks. Run in CI (`security` job) and verified locally.
+- **`gosec -severity medium`**: 0 issues, with five `#nosec` suppressions that
+  each carry a written justification (three G101 SQL column lists, G704 on the
+  operator-set healthcheck address, G710 on the validated federation redirect).
+  Run in CI.
+- **`staticcheck`**: clean. Run in CI.
 - CI also runs gofmt, `go vet`, build, `go test -race` against a disposable Postgres, and the smoke + feature suites against a booted engine.
+
+## Independent assessment (2026-10-29)
+
+A full-source, tool-assisted and dynamic assessment of `origin/main` `69015ac`
+was performed on branch `security/assessment-2026-10-29`; the report, evidence
+and re-test output are in
+[SECURITY_ASSESSMENT_2026-10-29.md](SECURITY_ASSESSMENT_2026-10-29.md).
+
+It found **no Critical or High** issue, three Medium and fourteen Low, and
+remediated every Medium and Low in the same branch with regression tests. The
+Medium findings were operational rather than exploitable: unindexed expiry
+purges (six hot tables sequentially scanned every ten minutes), a `user_id::text`
+cast that defeated the index on every credential change, and token responses
+that were cacheable (RFC 6749 §5.1). Low findings covered missing CSP/CORS,
+an uncapped TOTP enrollment code, body-limit and JSON-trailing-data handling,
+an unthrottled `/userinfo`, a dotless-email inconsistency, a `uint64 → int`
+narrowing, a bootstrap-marker ordering bug, IdP deletion leaving sessions alive,
+and a per-request `last_used_at` write. Twelve reachable standard-library
+vulnerabilities were also closed by pinning the toolchain.
+
+Register rows added: **N21** (purge/index gaps), **N22** (cacheable token
+responses), **N23** (uncapped TOTP enrollment), **N24** (no CORS), **N25**
+(`userinfo` 403 after revocation), **N26** (quota check-then-insert race),
+**N27** (`/healthz` unthrottled). N21–N24 are fixed; N25–N27 are accepted with
+the compensating controls noted in the report.
 
 ## What source review does NOT establish
 

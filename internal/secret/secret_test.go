@@ -35,7 +35,11 @@ func TestHMACIsKeyed(t *testing.T) {
 	if HMAC([32]byte{1}, "m") == HMAC([32]byte{2}, "m") {
 		t.Fatal("different keys must give different MACs")
 	}
-	if HMAC([32]byte{1}, "m") != HMAC([32]byte{1}, "m") {
+	// Assigned first: staticcheck flags two identical call expressions on
+	// either side of a comparison (SA4000), even though determinism is exactly
+	// what this asserts.
+	first, second := HMAC([32]byte{1}, "m"), HMAC([32]byte{1}, "m")
+	if first != second {
 		t.Fatal("HMAC must be deterministic")
 	}
 }

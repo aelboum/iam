@@ -6,6 +6,7 @@ package sizing
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"strconv"
@@ -107,7 +108,14 @@ func Check(slots int, limitBytes uint64, known bool) (warning string, ok bool) {
 	if !known {
 		return "", true
 	}
-	limitMiB := int(limitBytes / (1024 * 1024))
+	// Clamp before narrowing: a cgroup limit above MaxInt MiB (never real, but
+	// possible from a bogus file) would otherwise wrap to a negative int and
+	// make every sizing check fail.
+	mib := limitBytes / (1024 * 1024)
+	if mib > math.MaxInt {
+		mib = math.MaxInt
+	}
+	limitMiB := int(mib)
 	needMiB := RequiredMiB(slots) + BaseReserveMiB
 	if needMiB <= limitMiB {
 		return "", true

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // IDP is an external OpenID Connect provider an org signs in with.
@@ -93,8 +94,25 @@ func (s *Store) ListIDPs(ctx context.Context, orgID string) ([]*IDP, error) {
 	return idps, mapErr(rows.Err())
 }
 
+// DeleteIDP removes an identity provider and ends the sessions of the users it
+// was linked to, so a deleted (or compromised-then-removed) IdP cannot keep
+// minting access through a session that is still open.
 func (s *Store) DeleteIDP(ctx context.Context, orgID, id string) error {
-	return s.execOne(ctx, `DELETE FROM identity_providers WHERE id = $1 AND org_id = $2`, id, orgID)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM sessions WHERE user_id IN
+				(SELECT user_id FROM user_identities WHERE idp_id = $1)`, id); err != nil {
+			return mapErr(err)
+		}
+		tag, err := tx.Exec(ctx, `DELETE FROM identity_providers WHERE id = $1 AND org_id = $2`, id, orgID)
+		if err != nil {
+			return mapErr(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 // --- identities -------------------------------------------------------------------------------

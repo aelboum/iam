@@ -181,6 +181,7 @@ func insertRefreshToken(ctx context.Context, tx pgx.Tx, rt *RefreshToken) error 
 	return mapErr(err)
 }
 
+// #nosec G101 -- SQL column list, not a credential.
 const refreshTokenColumns = `id, token_hash, client_id, subject, audience, scopes, amr, auth_time,
 	access_token_id, expires_at, family_id, used_at`
 
@@ -245,6 +246,7 @@ func (s *Store) RevokeUserProjectTokens(ctx context.Context, projectID, userID s
 // projectTokenCond matches tokens for project $1: tokens issued to the
 // project's apps, and machine-user tokens carrying the project scope (those
 // are issued to the machine's own client id, audit L5).
+// #nosec G101 -- SQL fragment, not a credential.
 const projectTokenCond = `(client_id IN (SELECT client_id FROM apps WHERE project_id = $1::uuid)
 	OR ('urn:iam:project:' || $1::text) = ANY(scopes))`
 
@@ -316,14 +318,21 @@ func (s *Store) RevokeUserTokens(ctx context.Context, subject string) error {
 var PurgedTables = []string{"auth_requests", "access_tokens", "refresh_tokens", "sessions", "signing_keys",
 	"email_verifications", "password_resets", "idp_intents", "webauthn_registrations"}
 
-// PurgeExpired removes expired protocol state.
+// PurgeExpired removes expired protocol state. A failure on one table is
+// collected and the remaining tables are still purged, so a single bad table
+// cannot leave every other one growing without bound; the first error is
+// returned for the caller to log.
 func (s *Store) PurgeExpired(ctx context.Context) error {
+	var firstErr error
 	for _, table := range PurgedTables {
 		if _, err := s.pool.Exec(ctx, `DELETE FROM `+table+` WHERE expires_at < now()`); err != nil {
-			return mapErr(err)
+			if firstErr == nil {
+				firstErr = mapErr(err)
+			}
+			continue
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // --- signing keys ----------------------------------------------------------------------

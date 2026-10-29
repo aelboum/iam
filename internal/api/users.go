@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/aelboum/iam/internal/authn"
 	"github.com/aelboum/iam/internal/secret"
 	"github.com/aelboum/iam/internal/store"
 )
@@ -16,8 +17,10 @@ import (
 var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 func validEmail(email string) error {
-	local, domain, ok := strings.Cut(email, "@")
-	if !ok || local == "" || domain == "" || len(email) > 254 || strings.ContainsAny(email, " \t\r\n") {
+	// Same conservative rule the federation path uses: one @, a dotted DNS
+	// domain, no whitespace or control characters. A dotless "a@b" would be
+	// accepted here but refused as an IdP claim, so both paths agree.
+	if !authn.ValidEmail(strings.ToLower(email)) {
 		return validationError("a valid email is required")
 	}
 	return nil
