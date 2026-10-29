@@ -16,7 +16,7 @@ name: iam-staging
 
 services:
   caddy:
-    image: caddy:2.8.4-alpine
+    image: caddy:2-alpine
     restart: unless-stopped
     ports:
       - "80:80"
@@ -63,6 +63,11 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    # Cap memory and PIDs so the argon2 auto-sizer sees a cgroup limit (its OOM
+    # guard then engages) and a flood cannot exhaust host memory or processes.
+    # Size mem_limit to argon2 hash slots x ~64 MiB plus headroom for your host.
+    mem_limit: 1g
+    pids_limit: 512
     healthcheck:
       # Distroless image has no shell/curl; the binary probes /healthz itself.
       test: ["CMD", "/iamd", "healthcheck"]
@@ -75,7 +80,7 @@ services:
 
   postgres:
     # Dedicated Postgres 17 for staging only; never published to the host.
-    image: postgres:17.2-alpine
+    image: postgres:17-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: iam
@@ -85,7 +90,11 @@ services:
       - pgdata:/var/lib/postgresql/data
     # Intentionally no `ports:` mapping — database access stays inside the
     # compose network. Reach it for backups via `docker compose exec postgres`.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
     security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    pids_limit: 512
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U iam"]
       interval: 5s

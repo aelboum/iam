@@ -2,9 +2,21 @@
 {$IAM_DOMAIN} {
 	encode zstd gzip
 
+	# Edge-level security headers. Setting them here (not only in the engine)
+	# means edge-generated responses — the /docs 404 and any Caddy error — carry
+	# them too. The engine sets the same values on proxied responses.
 	header {
 		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
 		-Server
+	}
+
+	# Pin TLS intent. This matches Caddy's current default, so it is a no-op today
+	# and a guard against a future default weakening.
+	tls {
+		protocols tls1.2 tls1.3
 	}
 
 	# Swagger UI is disabled in production; refuse the path at the edge too.

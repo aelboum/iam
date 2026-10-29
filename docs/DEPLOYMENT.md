@@ -80,6 +80,40 @@ redirect URIs refused.
   they hold across all engine instances.
 - Signing keys are coordinated through Postgres, so several instances can share one database.
 
+## DNS and domain
+
+`IAM_DOMAIN` must be a bare fully-qualified hostname — no scheme, port or path
+(for example `auth.example.com`, not `https://auth.example.com/`). It feeds both
+the Caddy site address and `IAM_ISSUER`; a value with a scheme or path produces a
+confusing Caddy startup failure rather than a clear one. The engine still fails
+fast on a bad issuer — `IAM_ISSUER` must be `https://` outside dev mode.
+
+The issuer domain is the root of trust for every token's `iss` claim, so harden
+the zone and the registration, not just the host:
+
+- **CAA** — restrict which CA may issue: `example.com. CAA 0 issue "letsencrypt.org"` (match the CA your ACME flow uses). The cheapest control available with automatic certificates.
+- **DNSSEC** — sign the zone; without it Caddy's ACME challenge is exposed to zone spoofing.
+- **Registrar lock + 2FA** — lock the domain and require 2FA. Losing the domain means losing control of every `iss` claim.
+- **HSTS preload** — the edge sends `max-age=63072000; includeSubDomains`. Either submit the domain to the preload list (closing the first-visit window) or drop `includeSubDomains` if subdomains are out of scope.
+
+## Mail delivery (reset and verification links)
+
+The engine sends no mail. Account recovery and verification return the token to
+the calling backend (see the `StartPasswordReset` trust note in the code and
+[SECURITY.md](SECURITY.md)); your backend delivers it. Reset mail is the
+highest-value phishing target an IdP has, so the delivery path must authenticate
+the sender:
+
+- **SPF** — publish an SPF record ending in `-all` for the sending domain.
+- **DKIM** — sign with an aligned DKIM key (the `d=` domain aligned with the `From` domain).
+- **DMARC** — publish `p=reject` with an `rua` address, so spoofed mail is rejected and reported.
+- **Dedicated sender subdomain** — send from a subdomain of, or a domain aligned with, `IAM_ISSUER` (for example `mail.example.com`), not an unrelated domain.
+- **Link host** — the reset/verification link host MUST equal `IAM_ISSUER`. A link built on any other host is indistinguishable from a phishing link.
+
+Without an aligned DKIM signature and `p=reject`, an attacker can spoof the
+sender domain and mail a lookalike reset link; the engine cannot detect or
+prevent that — it is entirely a property of your mail and DNS setup.
+
 ## Upgrading past the audit-remediation release
 
 This release changes some defaults and one API contract. Review before upgrading
