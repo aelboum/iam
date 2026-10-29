@@ -242,6 +242,9 @@ func (s *Server) redeemFederatedLogin(w http.ResponseWriter, r *http.Request) {
 
 // IDPCallback is where external identity providers send the browser back.
 // It is public: the one-time state parameter authenticates the request.
+// The redirect target is the intent's return_url, which was validated as an
+// https origin when the login started (redirectURLAllowed), so the tainted
+// value cannot become an open redirect.
 func (s *Server) IDPCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	target, err := s.authn.HandleCallback(r.Context(), q.Get("state"), q.Get("code"), q.Get("error"))
@@ -249,6 +252,7 @@ func (s *Server) IDPCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid or expired login attempt", http.StatusBadRequest)
 		return
 	}
+	// #nosec G710 -- target is a validated return_url, never a raw request value.
 	http.Redirect(w, r, target, http.StatusFound)
 }
 

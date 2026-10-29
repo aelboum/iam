@@ -103,8 +103,8 @@ jobs:
           python3 scripts/smoke_test.py http://localhost:8080
           python3 scripts/features_test.py http://localhost:8080
 
-  # Dependency vulnerability scanning (govulncheck: reachable analysis),
-  # secret scanning (gitleaks over full history).
+  # Static analysis beyond go vet: gosec (security rules) and staticcheck.
+  # Both are gates; reviewed false positives carry a //nosec justification.
   security:
     runs-on: ubuntu-latest
     steps:
@@ -123,3 +123,11 @@ jobs:
         run: |
           docker run --rm -v "$PWD":/repo zricethezav/gitleaks:latest \
             detect --source=/repo --redact --no-banner
+      - name: gosec (security static analysis)
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          "$(go env GOPATH)/bin/gosec" -quiet -severity medium -confidence medium ./...
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          "$(go env GOPATH)/bin/staticcheck" ./...

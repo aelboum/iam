@@ -26,6 +26,7 @@ type APIKey struct {
 	LastUsedAt *time.Time `json:"last_used_at"`
 }
 
+// #nosec G101 -- SQL column list, not a credential.
 const apiKeyColumns = `id, name, org_id, scope, expires_at, created_at, last_used_at`
 
 func scanAPIKey(row interface{ Scan(...any) error }) (*APIKey, error) {
@@ -47,28 +48,50 @@ func (s *Store) CreateAPIKey(ctx context.Context, name string, orgID *string, sc
 // BootstrapAPIKey creates the instance admin key on the very first start only.
 // Once created, deleting or rotating it through the API is permanent: it is
 // not recreated from the environment on restart.
+//
+// The key row is inserted before the instance_state marker, so a failed insert
+// (a transient database error) does not leave the marker behind and suppress
+// bootstrap forever. Both statements share one transaction, so a rollback
+// removes the marker too.
 func (s *Store) BootstrapAPIKey(ctx context.Context, name, keyHash string) (created bool, err error) {
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx,
-			`INSERT INTO instance_state (key) VALUES ('bootstrap_admin_key') ON CONFLICT DO NOTHING`)
-		if err != nil || tag.RowsAffected() == 0 {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM instance_state WHERE key = 'bootstrap_admin_key')`).Scan(&exists); err != nil {
 			return mapErr(err)
 		}
-		tag, err = tx.Exec(ctx,
+		if exists {
+			return nil
+		}
+		tag, err := tx.Exec(ctx,
 			`INSERT INTO api_keys (id, name, key_hash) VALUES ($1, $2, $3) ON CONFLICT (key_hash) DO NOTHING`,
 			uuid.NewString(), name, keyHash)
-		created = err == nil && tag.RowsAffected() == 1
+		if err != nil {
+			return mapErr(err)
+		}
+		created = tag.RowsAffected() == 1
+		_, err = tx.Exec(ctx, `INSERT INTO instance_state (key) VALUES ('bootstrap_admin_key')`)
 		return mapErr(err)
 	})
 	return created, err
 }
 
 // AuthenticateAPIKey looks up an unexpired key by hash and records its use.
+// last_used_at is refreshed at most once a minute: it is only a bookkeeping
+// signal, and writing it on every authenticated request doubles the statement
+// count and WAL volume of the whole API. The refresh is best-effort, so a
+// bookkeeping failure never fails authentication.
 func (s *Store) AuthenticateAPIKey(ctx context.Context, keyHash string) (*APIKey, error) {
-	return scanAPIKey(s.pool.QueryRow(ctx, `
-		UPDATE api_keys SET last_used_at = now()
-		WHERE key_hash = $1 AND (expires_at IS NULL OR expires_at > now())
-		RETURNING `+apiKeyColumns, keyHash))
+	key, err := scanAPIKey(s.pool.QueryRow(ctx, `
+		SELECT `+apiKeyColumns+` FROM api_keys
+		WHERE key_hash = $1 AND (expires_at IS NULL OR expires_at > now())`, keyHash))
+	if err != nil {
+		return nil, err
+	}
+	if key.LastUsedAt == nil || time.Since(*key.LastUsedAt) > time.Minute {
+		_, _ = s.pool.Exec(ctx, `UPDATE api_keys SET last_used_at = now() WHERE id = $1`, key.ID)
+	}
+	return key, nil
 }
 
 // ListAPIKeys lists the keys of an org, or the instance keys when orgID is nil.

@@ -94,6 +94,14 @@ func TestRequiredMiB(t *testing.T) {
 	}
 }
 
+// A limit above MaxInt MiB must clamp instead of wrapping to a negative int,
+// which would make every sizing check fail (gosec G115).
+func TestCheckClampsHugeLimit(t *testing.T) {
+	if warn, ok := Check(2, ^uint64(0), true); !ok || warn != "" {
+		t.Fatalf("huge limit: got ok=%v warn=%q, want ok=true", ok, warn)
+	}
+}
+
 // On this (non-Linux) host the cgroup files are absent, so MemoryLimit must
 // report the limit as unknown rather than inventing one.
 func TestMemoryLimitUnknownWhenNoCgroup(t *testing.T) {

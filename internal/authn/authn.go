@@ -201,9 +201,23 @@ func (s *Service) EnrollTOTP(ctx context.Context, user *store.User) (secretValue
 	return key.Secret(), key.URL(), nil
 }
 
+// maxTOTPEnrollAttempts bounds guessing of a pending enrollment code. The
+// pending secret is only known to whoever started the enrollment, but the
+// six-digit code itself was previously verifiable without any cap.
+const maxTOTPEnrollAttempts = 5
+
 func (s *Service) VerifyTOTPEnrollment(ctx context.Context, user *store.User, code string) error {
+	reserved, err := s.store.ReserveTOTPEnrollAttempt(ctx, user.ID, maxTOTPEnrollAttempts)
+	if err != nil {
+		return err
+	}
+	if !reserved {
+		return ErrRateLimited
+	}
 	ok, err := s.acceptTOTP(ctx, user, code)
 	if err != nil {
+		// The code was never evaluated: give the attempt back.
+		_ = s.store.ReleaseTOTPEnrollAttempt(ctx, user.ID)
 		return err
 	}
 	if !ok {

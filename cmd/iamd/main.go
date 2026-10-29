@@ -167,7 +167,7 @@ func run() error {
 	if cfg.TrustProxy {
 		router.Use(forwardedFor(cfg.ProxyHops))
 	}
-	router.Use(middleware.Recoverer, securityHeaders, limitOAuthEndpoints(limits))
+	router.Use(middleware.Recoverer, securityHeaders, noStore, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
@@ -249,6 +249,7 @@ func healthcheck() int {
 		}
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
+	// #nosec G704 -- the target is the operator-set IAM_LISTEN_ADDR, not user input.
 	resp, err := client.Get("http://" + addr + "/healthz")
 	if err != nil {
 		return 1
@@ -359,18 +360,75 @@ func purgeOnce() error {
 	return st.PurgeRateLimits(ctx)
 }
 
-// securityHeaders sets defensive headers on every response.
+// securityHeaders sets defensive headers on every response. The CSP is
+// restrictive for JSON/API responses (nothing is loaded); the /docs handler
+// overrides it with the policy its CDN-hosted assets need.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("Permissions-Policy", "accelerometer=(), camera=(), geolocation=(), microphone=(), payment=(), usb=()")
 		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
 			h.Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// noStorePaths are responses that carry tokens or token-derived identity.
+// RFC 6749 §5.1 requires Cache-Control: no-store on any response containing
+// tokens or credentials; RFC 6750 §5.3 asks for it on protected-resource
+// responses too, so a shared cache cannot replay a revoked token's answer.
+var noStorePaths = map[string]bool{
+	"/oauth/token": true, "/oauth/introspect": true, "/revoke": true,
+	"/userinfo": true, "/authorize/callback": true,
+}
+
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if noStorePaths[r.URL.Path] {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Pragma", "no-cache")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// cors answers preflight requests and, when origins are configured, allows
+// exactly those origins. The API is normally called server-to-server, so the
+// default (no IAM_CORS_ORIGINS) adds no CORS headers at all.
+func cors(allowed []string) func(http.Handler) http.Handler {
+	allow := map[string]bool{}
+	for _, o := range allowed {
+		allow[o] = true
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			if origin != "" && allow[origin] {
+				h := w.Header()
+				h.Set("Access-Control-Allow-Origin", origin)
+				h.Set("Access-Control-Allow-Credentials", "true")
+				h.Add("Vary", "Origin")
+				if r.Method == http.MethodOptions {
+					h.Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
+					h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Session-Token, X-End-User-IP")
+					h.Set("Access-Control-Max-Age", "600")
+				}
+			}
+			if r.Method == http.MethodOptions {
+				w.Header().Set("Allow", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // limitOAuthEndpoints rate-limits the token, introspection and revocation
@@ -385,19 +443,23 @@ func limitOAuthEndpoints(limits ratelimit.Factory) func(http.Handler) http.Handl
 	callbackLimiter := limits("idp-callback", 60, 30)
 	limited := map[string]ratelimit.Allower{
 		"/oauth/token": limiter, "/oauth/introspect": limiter, "/revoke": limiter,
+		"/userinfo":  limiter,
 		"/authorize": authorizeLimiter, "/authorize/callback": authorizeLimiter,
 		authn.CallbackPath: callbackLimiter,
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if l := limited[r.URL.Path]; l != nil {
+			// Trim a trailing slash so /oauth/token/ is limited like /oauth/token.
+			if l := limited[strings.TrimSuffix(r.URL.Path, "/")]; l != nil {
 				host, _, err := net.SplitHostPort(r.RemoteAddr)
 				if err != nil {
 					host = r.RemoteAddr
 				}
 				if !l.Allow(host) {
 					w.Header().Set("Retry-After", "60")
-					http.Error(w, `{"error":"slow_down"}`, http.StatusTooManyRequests)
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":"too many requests, try again later"}` + "\n"))
 					return
 				}
 			}

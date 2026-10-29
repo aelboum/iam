@@ -184,12 +184,15 @@ func (s *Store) DeletePasswordResets(ctx context.Context, userID string) error {
 }
 
 // revokeUserCredentialsTx ends a user's tokens, sessions and reset tokens.
+// The uuid columns are compared as uuid ($1::uuid), not as text, so the
+// sessions_user_idx / password_resets_user_expires_idx indexes are used
+// instead of a sequential scan on every credential change.
 func revokeUserCredentialsTx(ctx context.Context, tx pgx.Tx, userID string) error {
 	for _, stmt := range []string{
 		`DELETE FROM access_tokens WHERE subject = $1`,
 		`DELETE FROM refresh_tokens WHERE subject = $1`,
-		`DELETE FROM sessions WHERE user_id::text = $1`,
-		`DELETE FROM password_resets WHERE user_id::text = $1`,
+		`DELETE FROM sessions WHERE user_id = $1::uuid`,
+		`DELETE FROM password_resets WHERE user_id = $1::uuid`,
 	} {
 		if _, err := tx.Exec(ctx, stmt, userID); err != nil {
 			return mapErr(err)

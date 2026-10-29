@@ -306,10 +306,22 @@ func (s *Server) audit(r *http.Request, orgID string, action, target string, det
 const maxBodyBytes = 1 << 20
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	// A declared oversize body is refused up front with 413 rather than being
+	// truncated into a confusing "unexpected EOF" 400.
+	if r.ContentLength > maxBodyBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body is too large")
+		return false
+	}
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return false
+	}
+	// Exactly one JSON value: trailing data (a truncated or concatenated body)
+	// is refused instead of being silently ignored.
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: trailing data after the JSON value")
 		return false
 	}
 	return true

@@ -72,6 +72,10 @@ type Config struct {
 	// Passkeys: the relying party ID (a domain) and the login UI origins.
 	WebAuthnRPID    string
 	WebAuthnOrigins []string
+
+	// CORSOrigins are the browser origins allowed to call the API directly.
+	// Empty means no CORS headers (the API is normally called server-to-server).
+	CORSOrigins []string
 }
 
 func Load() (*Config, error) {
@@ -176,6 +180,21 @@ func Load() (*Config, error) {
 	}
 	if err := ValidateWebAuthn(cfg.WebAuthnRPID, cfg.WebAuthnOrigins, cfg.DevMode); err != nil {
 		return nil, err
+	}
+	// CORS is opt-in: only exact origins, and https outside dev mode, so a
+	// wildcard or a typo cannot silently widen who may call the API.
+	for _, o := range strings.Split(os.Getenv("IAM_CORS_ORIGINS"), ",") {
+		if o = strings.TrimSpace(o); o == "" {
+			continue
+		}
+		u, err := url.Parse(o)
+		if err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+			return nil, fmt.Errorf("IAM_CORS_ORIGINS entry %q must be an origin like https://app.example.com", o)
+		}
+		if u.Scheme != "https" && !(cfg.DevMode && u.Scheme == "http") {
+			return nil, fmt.Errorf("IAM_CORS_ORIGINS entry %q must use https unless IAM_DEV_MODE=true", o)
+		}
+		cfg.CORSOrigins = append(cfg.CORSOrigins, o)
 	}
 	return cfg, nil
 }

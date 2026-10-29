@@ -296,9 +296,33 @@ func (s *Store) DeleteUserSessions(ctx context.Context, userID string) error {
 	})
 }
 
-// SetPendingTOTP stores a new, not yet verified TOTP secret.
+// SetPendingTOTP stores a new, not yet verified TOTP secret. The enrollment
+// attempt counter is reset, so a new enrollment gets a fresh guess budget.
 func (s *Store) SetPendingTOTP(ctx context.Context, id string, secretEnc []byte) error {
-	return s.execOne(ctx, `UPDATE users SET totp_secret_enc = $2, totp_verified = false, totp_last_step = NULL, updated_at = now() WHERE id = $1`, id, secretEnc)
+	return s.execOne(ctx, `UPDATE users SET totp_secret_enc = $2, totp_verified = false, totp_last_step = NULL, totp_enroll_attempts = 0, updated_at = now() WHERE id = $1`, id, secretEnc)
+}
+
+// ReserveTOTPEnrollAttempt counts a pending-enrollment verification attempt.
+// It returns false once max attempts are already counted, so a six-digit
+// enrollment code cannot be brute-forced without bound. A successful
+// verification does not need to clear the counter: the secret is replaced (and
+// the counter reset) by the next enrollment.
+func (s *Store) ReserveTOTPEnrollAttempt(ctx context.Context, id string, max int) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE users SET totp_enroll_attempts = totp_enroll_attempts + 1
+		WHERE id = $1 AND totp_enroll_attempts < $2`, id, max)
+	if err != nil {
+		return false, mapErr(err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ReleaseTOTPEnrollAttempt undoes a reserved enrollment attempt that was never
+// evaluated (an internal error before the code was checked), floored at zero.
+func (s *Store) ReleaseTOTPEnrollAttempt(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE users SET totp_enroll_attempts = totp_enroll_attempts - 1 WHERE id = $1 AND totp_enroll_attempts > 0`, id)
+	return mapErr(err)
 }
 
 // AcceptTOTPStep records step as used. It returns false if this or a later
