@@ -391,7 +391,9 @@ var noStorePaths = map[string]bool{
 
 func noStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if noStorePaths[r.URL.Path] {
+		// Trim a trailing slash so /oauth/token/ gets no-store like /oauth/token,
+		// matching the rate limiter's path normalisation.
+		if noStorePaths[strings.TrimSuffix(r.URL.Path, "/")] {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Pragma", "no-cache")
 		}
@@ -409,8 +411,17 @@ func cors(allowed []string) func(http.Handler) http.Handler {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// This CORS layer covers only the management API (/v1...). The mounted
+			// OIDC provider serves its own CORS on its public endpoints, so its
+			// requests — and any preflight for them — must pass through untouched:
+			// answering OPTIONS here for every path would strip the provider's CORS
+			// and break browser SPAs on /oauth/token and discovery.
+			if !strings.HasPrefix(r.URL.Path, "/v1") {
+				next.ServeHTTP(w, r)
+				return
+			}
 			origin := r.Header.Get("Origin")
-			if origin != "" && allow[origin] {
+			if norm, ok := config.NormalizeOrigin(origin); ok && allow[norm] {
 				h := w.Header()
 				h.Set("Access-Control-Allow-Origin", origin)
 				h.Set("Access-Control-Allow-Credentials", "true")

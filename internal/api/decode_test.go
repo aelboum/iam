@@ -62,6 +62,22 @@ func TestDecodeRejectsOversizeBody(t *testing.T) {
 	}
 }
 
+// An unknown-length (chunked) oversize body has no ContentLength, so the early
+// check cannot catch it; http.MaxBytesReader must still make it a 413 rather
+// than a confusing trailing-data 400.
+func TestDecodeRejectsOversizeChunkedBody(t *testing.T) {
+	rec := httptest.NewRecorder()
+	big := `{"name":"` + strings.Repeat("a", maxBodyBytes+100) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/orgs", strings.NewReader(big))
+	req.ContentLength = -1 // simulate chunked transfer with unknown length
+	if decode(rec, req, &body{}) {
+		t.Fatal("decode accepted an oversize chunked body")
+	}
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+}
+
 // The API and the federation path must agree on what an email is: a dotless
 // "a@b" is now refused by both.
 func TestValidEmailRequiresDottedDomain(t *testing.T) {

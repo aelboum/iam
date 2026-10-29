@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -158,5 +160,50 @@ func TestDeleteIDPRevokesLinkedSessions(t *testing.T) {
 	}
 	if err := st.DeleteIDP(ctx, org.ID, idp.ID); err != ErrNotFound {
 		t.Fatalf("second delete = %v, want ErrNotFound", err)
+	}
+}
+
+// Two instances starting at once against a fresh database must race gracefully:
+// exactly one creates the bootstrap key and neither errors. The marker insert
+// carries ON CONFLICT DO NOTHING; without it the losing instance crashed startup
+// on a duplicate-key error (independent security assessment follow-up).
+func TestBootstrapAPIKeyConcurrentStartIsGraceful(t *testing.T) {
+	pool, st := testPool(t)
+	ctx := context.Background()
+	name := "bootstrap-race-" + uuid.NewString()
+	// Clean slate for the shared bootstrap marker and this key.
+	pool.Exec(ctx, `DELETE FROM instance_state WHERE key = 'bootstrap_admin_key'`)
+	t.Cleanup(func() {
+		pool.Exec(ctx, `DELETE FROM api_keys WHERE name = $1`, name)
+		pool.Exec(ctx, `DELETE FROM instance_state WHERE key = 'bootstrap_admin_key'`)
+	})
+	keyHash := uuid.NewString()
+	const n = 8
+	var (
+		wg      sync.WaitGroup
+		created int32
+	)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := st.BootstrapAPIKey(ctx, name, keyHash)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if ok {
+				atomic.AddInt32(&created, 1)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent BootstrapAPIKey errored: %v", err)
+	}
+	if created != 1 {
+		t.Errorf("created count = %d, want exactly 1", created)
 	}
 }

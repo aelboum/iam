@@ -187,16 +187,44 @@ func Load() (*Config, error) {
 		if o = strings.TrimSpace(o); o == "" {
 			continue
 		}
-		u, err := url.Parse(o)
-		if err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		norm, ok := NormalizeOrigin(o)
+		if !ok {
 			return nil, fmt.Errorf("IAM_CORS_ORIGINS entry %q must be an origin like https://app.example.com", o)
 		}
-		if u.Scheme != "https" && !(cfg.DevMode && u.Scheme == "http") {
+		if !strings.HasPrefix(norm, "https://") && !(cfg.DevMode && strings.HasPrefix(norm, "http://")) {
 			return nil, fmt.Errorf("IAM_CORS_ORIGINS entry %q must use https unless IAM_DEV_MODE=true", o)
 		}
-		cfg.CORSOrigins = append(cfg.CORSOrigins, o)
+		// Stored normalised (lowercase scheme/host, default port dropped) so the
+		// exact-match against the browser-sent Origin cannot silently miss on case
+		// or an explicit default port.
+		cfg.CORSOrigins = append(cfg.CORSOrigins, norm)
 	}
 	return cfg, nil
+}
+
+// NormalizeOrigin canonicalises an HTTP Origin for exact-match comparison: the
+// scheme and host are lowercased and the scheme's default port is dropped, so
+// https://App.Example.com and https://app.example.com:443 both compare equal to
+// the browser-sent https://app.example.com. ok is false when s is not a bare
+// origin (scheme://host[:port], nothing else).
+func NormalizeOrigin(s string) (string, bool) {
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", false
+	}
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return scheme + "://" + host, true
 }
 
 // ValidateWebAuthn checks the passkey relying party settings (audit L10):

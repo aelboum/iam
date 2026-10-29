@@ -52,7 +52,10 @@ func (s *Store) CreateAPIKey(ctx context.Context, name string, orgID *string, sc
 // The key row is inserted before the instance_state marker, so a failed insert
 // (a transient database error) does not leave the marker behind and suppress
 // bootstrap forever. Both statements share one transaction, so a rollback
-// removes the marker too.
+// removes the marker too. Both inserts tolerate a conflict (ON CONFLICT DO
+// NOTHING), so two instances starting at once against a fresh database race
+// gracefully — the loser inserts nothing and returns created=false — instead of
+// one crashing startup on a duplicate-key error.
 func (s *Store) BootstrapAPIKey(ctx context.Context, name, keyHash string) (created bool, err error) {
 	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		var exists bool
@@ -70,7 +73,7 @@ func (s *Store) BootstrapAPIKey(ctx context.Context, name, keyHash string) (crea
 			return mapErr(err)
 		}
 		created = tag.RowsAffected() == 1
-		_, err = tx.Exec(ctx, `INSERT INTO instance_state (key) VALUES ('bootstrap_admin_key')`)
+		_, err = tx.Exec(ctx, `INSERT INTO instance_state (key) VALUES ('bootstrap_admin_key') ON CONFLICT (key) DO NOTHING`)
 		return mapErr(err)
 	})
 	return created, err

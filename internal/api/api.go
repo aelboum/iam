@@ -306,21 +306,34 @@ func (s *Server) audit(r *http.Request, orgID string, action, target string, det
 const maxBodyBytes = 1 << 20
 
 func decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	// A declared oversize body is refused up front with 413 rather than being
-	// truncated into a confusing "unexpected EOF" 400.
+	// A declared oversize body is refused up front with 413. An unknown-length
+	// (chunked) body has no ContentLength, so http.MaxBytesReader enforces the
+	// same cap and reports *http.MaxBytesError, which is also surfaced as 413
+	// rather than a confusing trailing-data 400.
 	if r.ContentLength > maxBodyBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, "request body is too large")
 		return false
 	}
-	dec := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body is too large")
+			return false
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
 		return false
 	}
 	// Exactly one JSON value: trailing data (a truncated or concatenated body)
-	// is refused instead of being silently ignored.
+	// is refused instead of being silently ignored; an oversize body caught only
+	// on this second read is still a 413.
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body is too large")
+			return false
+		}
 		writeError(w, http.StatusBadRequest, "invalid JSON body: trailing data after the JSON value")
 		return false
 	}

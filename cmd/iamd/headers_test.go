@@ -48,7 +48,7 @@ func TestSecurityHeaders(t *testing.T) {
 // must not gain the header.
 func TestNoStoreOnlyOnTokenPaths(t *testing.T) {
 	h := noStore(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	for _, p := range []string{"/oauth/token", "/oauth/introspect", "/revoke", "/userinfo", "/authorize/callback"} {
+	for _, p := range []string{"/oauth/token", "/oauth/introspect", "/revoke", "/userinfo", "/authorize/callback", "/oauth/token/", "/userinfo/"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("POST", p, nil))
 		if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
@@ -95,6 +95,27 @@ func TestCORS(t *testing.T) {
 	}
 	if rec.Header().Get("Access-Control-Allow-Methods") == "" {
 		t.Error("preflight is missing Access-Control-Allow-Methods")
+	}
+
+	// A provider path (not /v1) must pass through untouched, not be answered 204
+	// here: the mounted OIDC provider owns its own CORS, so OPTIONS reaches the
+	// next handler (which writes 200) instead of this middleware short-circuiting.
+	req = httptest.NewRequest("OPTIONS", "/oauth/token", nil)
+	req.Header.Set("Origin", "https://app.example.com")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("provider preflight short-circuited: status = %d, want the next handler's 200", rec.Code)
+	}
+
+	// Case and an explicit default port must still match the listed origin; the
+	// browser-sent Origin is echoed verbatim.
+	req = httptest.NewRequest("GET", "/v1/orgs", nil)
+	req.Header.Set("Origin", "https://App.Example.com:443")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://App.Example.com:443" {
+		t.Errorf("normalized-equal origin not echoed: %q", got)
 	}
 }
 
