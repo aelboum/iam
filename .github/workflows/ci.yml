@@ -131,3 +131,33 @@ jobs:
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
           "$(go env GOPATH)/bin/staticcheck" ./...
+
+  # Container image and infrastructure scan. govulncheck covers Go modules only;
+  # this builds the runtime image and scans it with Trivy for OS and library
+  # CVEs in the base layers that govulncheck cannot see, then scans the
+  # Dockerfile and compose files for misconfiguration. The Trivy scanner is
+  # pinned to an exact version for reproducible results. The vulnerability scan
+  # gates on HIGH/CRITICAL that have a fix available: --ignore-unfixed means an
+  # upstream CVE with no patch yet is reported in the log but does not wedge the
+  # pipeline, matching the floating base-image tags (an image rebuild picks up
+  # the fix as soon as upstream ships it).
+  image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build runtime image
+        run: docker build -t iam:ci .
+      - name: export image for scanning
+        run: docker save iam:ci -o /tmp/iam-ci.tar
+      - name: trivy image scan (OS + library CVEs)
+        run: |
+          docker run --rm -v /tmp/iam-ci.tar:/image.tar:ro aquasec/trivy:0.58.1 \
+            image --input /image.tar \
+            --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress
+      - name: trivy config scan (Dockerfile + compose misconfig)
+        run: |
+          docker run --rm -v "$PWD":/repo:ro aquasec/trivy:0.58.1 \
+            config /repo \
+            --severity HIGH,CRITICAL \
+            --exit-code 1
