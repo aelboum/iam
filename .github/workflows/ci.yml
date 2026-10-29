@@ -160,4 +160,4 @@ jobs:
           docker run --rm -v "$PWD":/repo:ro aquasec/trivy:0.58.1 \
             config /repo \
             --severity HIGH,CRITICAL \
-            --exit-code 1 --no-progress
+            --exit-code 1
