@@ -65,15 +65,17 @@ func (s *Storage) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest, 
 		// The engine keeps no browser SSO session, so silent login is impossible.
 		return nil, oidc.ErrLoginRequired()
 	}
-	if req.CodeChallenge != "" && req.CodeChallengeMethod != oidc.CodeChallengeMethodS256 {
-		return nil, oidc.ErrInvalidRequest().WithDescription("code_challenge_method must be S256")
-	}
+	// PKCE is required for every interactive client (audit L1). Only web, spa and
+	// native apps reach /authorize; machine clients use client_credentials and
+	// never create an auth request. For public clients (spa/native) PKCE is the
+	// only protection against a stolen authorization code; for confidential web
+	// clients it is defence-in-depth per OAuth 2.1, binding the code to the
+	// client instance that began the flow even if the client secret leaks.
 	if req.CodeChallenge == "" {
-		// Public clients cannot authenticate at the token endpoint; PKCE is
-		// their only protection against stolen codes, so require it up front.
-		if app, err := s.store.GetAppByClientID(ctx, req.ClientID); err == nil && app.AuthMethod == "none" {
-			return nil, oidc.ErrInvalidRequest().WithDescription("PKCE (code_challenge, S256) is required for this client")
-		}
+		return nil, oidc.ErrInvalidRequest().WithDescription("PKCE (code_challenge, S256) is required")
+	}
+	if req.CodeChallengeMethod != oidc.CodeChallengeMethodS256 {
+		return nil, oidc.ErrInvalidRequest().WithDescription("code_challenge_method must be S256")
 	}
 	// Bound the free-form parameters an unauthenticated caller can get stored
 	// via /authorize (they live 30 minutes), so a client_id + redirect_uri

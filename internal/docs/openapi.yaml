@@ -506,7 +506,7 @@ paths:
     post:
       tags: [Apps]
       summary: Create OIDC app
-      description: Web apps get a `client_secret`, shown only once. `spa` and `native` apps are public clients and must use PKCE.
+      description: Web apps get a `client_secret`, shown only once. `spa` and `native` apps are public clients. Every interactive client (web, spa, native) must use PKCE (S256) on the authorization-code flow.
       requestBody:
         required: true
         content:

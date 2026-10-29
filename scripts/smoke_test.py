@@ -27,6 +27,13 @@ ISSUER = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
 REDIRECT_URI = "http://localhost:9999/callback"
 LOGIN_URL = "http://localhost:3000/login"
 
+# PKCE is required for every interactive client, including confidential web
+# apps. This default pair is threaded through login()/token() for the web flow;
+# the SPA tests below supply their own challenge/verifier.
+PKCE_VERIFIER = secrets.token_urlsafe(48)
+PKCE_CHALLENGE = base64.urlsafe_b64encode(
+    hashlib.sha256(PKCE_VERIFIER.encode()).digest()).rstrip(b"=").decode()
+
 
 def admin_key():
     if os.environ.get("IAM_BOOTSTRAP_ADMIN_KEY"):
@@ -96,10 +103,13 @@ def jwt_claims(token):
 def login(key, org, login_name, password, client_id, extra=None):
     """Drive authorize -> session API -> callback; return the auth code."""
     state = secrets.token_urlsafe(8)
+    extra = extra or {}
+    if "code_challenge" not in extra:
+        extra = {**extra, "code_challenge": PKCE_CHALLENGE, "code_challenge_method": "S256"}
     q = urllib.parse.urlencode({
         "client_id": client_id, "redirect_uri": REDIRECT_URI, "response_type": "code",
         "scope": "openid profile email offline_access", "state": state, "nonce": "n-1",
-        "prompt": "consent", **(extra or {}),
+        "prompt": "consent", **extra,
     })
     status, _, headers = http("GET", "/authorize?" + q)
     loc = headers.get("Location", "")
@@ -140,6 +150,10 @@ def password_step(key, org, login_name, password):
 
 
 def token(basic, **form):
+    # The web flow logs in with the default PKCE pair; attach the matching
+    # verifier on the code exchange (refresh exchanges carry no code).
+    if form.get("grant_type") == "authorization_code" and "code_verifier" not in form:
+        form["code_verifier"] = PKCE_VERIFIER
     return http("POST", "/oauth/token", headers={"Authorization": basic}, form=form)[:2]
 
 
@@ -290,7 +304,8 @@ def main():
 
     # Org-scoped login keys only see auth requests of apps their org can use.
     q = urllib.parse.urlencode({"client_id": app["client_id"], "redirect_uri": REDIRECT_URI, "response_type": "code",
-                                "scope": "openid", "state": "s", "nonce": "n"})
+                                "scope": "openid", "state": "s", "nonce": "n",
+                                "code_challenge": PKCE_CHALLENGE, "code_challenge_method": "S256"})
     loc = http("GET", "/authorize?" + q)[2].get("Location", "")
     ar = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["authRequest"][0]
     other0 = api(key, "POST", "/orgs", {"name": "Outsider", "slug": f"outsider-{suffix}"})
@@ -310,6 +325,12 @@ def main():
                                 "scope": "openid", "state": "s"})
     status, _, hdrs = http("GET", "/authorize?" + q)
     check("error=invalid_request" in hdrs.get("Location", "") or status == 400, "public client without PKCE is refused")
+
+    # Confidential web clients must use PKCE too (audit L1): defence in depth.
+    qw = urllib.parse.urlencode({"client_id": app["client_id"], "redirect_uri": REDIRECT_URI,
+                                 "response_type": "code", "scope": "openid", "state": "s"})
+    status, _, hdrs = http("GET", "/authorize?" + qw)
+    check("error=invalid_request" in hdrs.get("Location", "") or status == 400, "confidential web client without PKCE is refused")
 
     # A wrong PKCE verifier must not burn the code for the real client.
     verifier = secrets.token_urlsafe(48)
