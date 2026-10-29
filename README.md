@@ -112,7 +112,8 @@ so a compromise of that server cannot manage users. Keys can expire
 | `GET /v1/orgs/{orgID}/audit`, `GET /v1/audit` | Audit trail: logins, lockouts, admin actions |
 
 Creating an app returns `client_secret` **once** (web apps). `spa`/`native`
-apps are public clients and must use PKCE.
+apps are public clients. Every interactive client — `web`, `spa` and `native`
+— must use PKCE (S256) on the authorization-code flow.
 
 ## Login flow (headless)
 
@@ -222,7 +223,7 @@ All of these are exercised by `scripts/smoke_test.py`.
 
 **Tokens and sessions**
 - `/revoke` on a refresh token ends the whole login, including its access tokens.
-- PKCE with S256 is required for public (`spa`, `native`) clients; `plain` is refused.
+- PKCE with S256 is required for every interactive client (`web`, `spa`, `native`); `plain` is refused.
 - `dev_mode` apps (plain-http redirects) can only be created when the engine runs with `IAM_DEV_MODE=true`.
 - Changing a password ends all sessions and tokens; changing TOTP ends logins in progress.
   Deleting an org, project, app or grant revokes the affected tokens.

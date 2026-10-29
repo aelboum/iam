@@ -108,7 +108,8 @@ def basic(client_id, client_secret):
 
 def start_authorize(client_id):
     q = urllib.parse.urlencode({"client_id": client_id, "redirect_uri": t.REDIRECT_URI, "response_type": "code",
-                                "scope": "openid profile email", "state": "st", "nonce": "nn"})
+                                "scope": "openid profile email", "state": "st", "nonce": "nn",
+                                "code_challenge": t.PKCE_CHALLENGE, "code_challenge_method": "S256"})
     loc = http("GET", "/authorize?" + q)[2].get("Location", "")
     return urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["authRequest"][0]
 
@@ -120,7 +121,8 @@ def finalize_and_exchange(key, auth_request, sess, app_basic):
     loc = http("GET", fin["callback_url"])[2].get("Location", "")
     code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)["code"][0]
     status, tokens, _ = http("POST", "/oauth/token", headers={"Authorization": app_basic},
-                             form={"grant_type": "authorization_code", "code": code, "redirect_uri": t.REDIRECT_URI})
+                             form={"grant_type": "authorization_code", "code": code, "redirect_uri": t.REDIRECT_URI,
+                                   "code_verifier": t.PKCE_VERIFIER})
     check(status == 200, "tokens issued for the authenticated session")
     _, info, _ = http("GET", "/userinfo", headers={"Authorization": "Bearer " + tokens["access_token"]})
     claims = {**t.jwt_claims(tokens["id_token"]), "email": info.get("email")}
