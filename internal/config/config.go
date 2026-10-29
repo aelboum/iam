@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aelboum/iam/internal/sizing"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type Config struct {
@@ -225,6 +226,19 @@ func NormalizeOrigin(s string) (string, bool) {
 		host += ":" + port
 	}
 	return scheme + "://" + host, true
+}
+
+// DatabaseUsesTLS reports whether the connection string will attempt or require
+// a TLS connection to Postgres. pgx resolves sslmode (and its libpq default,
+// prefer) into a TLS config: sslmode=disable leaves it nil, i.e. a plaintext
+// connection, while prefer/require/verify-ca/verify-full all set one. The caller
+// uses this only to warn in production; the database URL is never logged.
+func DatabaseUsesTLS(databaseURL string) (bool, error) {
+	c, err := pgconn.ParseConfig(databaseURL)
+	if err != nil {
+		return false, err
+	}
+	return c.TLSConfig != nil, nil
 }
 
 // ValidateWebAuthn checks the passkey relying party settings (audit L10):

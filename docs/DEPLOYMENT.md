@@ -80,6 +80,39 @@ redirect URIs refused.
   they hold across all engine instances.
 - Signing keys are coordinated through Postgres, so several instances can share one database.
 
+## Database TLS
+
+The engine reaches Postgres through `IAM_DATABASE_URL`, and the `sslmode`
+parameter in that URL decides whether the connection is encrypted. It carries
+the database password, every token, and all row data, so whether it needs TLS
+depends entirely on the network between the engine and Postgres:
+
+- **Same host, private network (the bundled compose files).** The engine and
+  Postgres run in one Docker network on one host; Postgres is never published.
+  The traffic never leaves the host, so `sslmode=disable` is acceptable and is
+  what the shipped `docker-compose.prod.yml` uses.
+- **Remote or managed Postgres (separate host, VPC, or a managed service).** The
+  connection crosses a network, so TLS is required. Use `sslmode=verify-full`,
+  which both encrypts the connection and verifies the server certificate against
+  a CA and the hostname — `require` encrypts but does not authenticate the
+  server, leaving it open to a man-in-the-middle.
+
+For `verify-full`, point the engine at the CA that signed the server's
+certificate and connect by the hostname on that certificate:
+
+```
+IAM_DATABASE_URL=postgres://iam:PASSWORD@db.example.com:5432/iam?sslmode=verify-full&sslrootcert=/etc/iam/pg-ca.pem
+```
+
+Mount the CA file read-only into the container (for example
+`./pg-ca.pem:/etc/iam/pg-ca.pem:ro`). Managed providers publish their CA bundle;
+download it over a trusted channel rather than trusting it on first use.
+
+Outside dev mode the engine logs a startup warning when it detects
+`sslmode=disable`, as a reminder that a plaintext database connection is only
+safe on a trusted single-host network. The warning is not fatal: the same-host
+compose deployment is a legitimate configuration.
+
 ## DNS and domain
 
 `IAM_DOMAIN` must be a bare fully-qualified hostname — no scheme, port or path

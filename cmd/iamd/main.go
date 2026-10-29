@@ -64,6 +64,18 @@ func run() error {
 		return err
 	}
 
+	// Warn once at startup if a production engine talks to Postgres without TLS.
+	// This is acceptable only when the engine and database share a trusted
+	// private network on a single host (as the bundled compose files do); for a
+	// remote or managed database, TLS is required to protect credentials and row
+	// data in transit. A parse error here is left to db.Open to report. The
+	// database URL is never logged (it carries the password).
+	if !cfg.DevMode {
+		if usesTLS, terr := config.DatabaseUsesTLS(cfg.DatabaseURL); terr == nil && !usesTLS {
+			slog.Warn("database connection is not using TLS (sslmode=disable); acceptable only when the engine and Postgres share a trusted private network on one host. For a remote or managed database set sslmode=verify-full with sslrootcert. See docs/DEPLOYMENT.md.")
+		}
+	}
+
 	// Size the process-wide password-hashing pool and check it against the
 	// container's memory limit before serving. Each slot can hold ~64 MiB
 	// resident while hashing, so an oversized pool risks OOM (internal security
