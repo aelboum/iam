@@ -258,7 +258,16 @@ global CSP (`default-src 'none'; … form-action 'self'`) that broke `response_m
 for relying parties (M-01) is now **fixed** — PR #21 (merged to `main`, commit `48649bf`) adds a
 page-scoped `relaxCSPForFormPost` middleware that permits the auto-submit and the single
 cross-origin POST to the validated redirect origin on the form_post page only, keeping the
-strict policy everywhere else, with regression test `TestFormPostCSP`. The six Low items (logout/factor-removal token
-semantics, discovery drift, session-token transport, Postgres service hardening) remain to be
-dispositioned. This audit does **not** satisfy criterion 12 and is **not** an independent
-external penetration test.
+strict policy everywhere else, with regression test `TestFormPostCSP`. The six Low items are now all
+dispositioned: L-02 (IdP-delete leaves tokens), L-03 (factor removal leaves tokens) and L-05
+(session-token transport) are **fixed** in PR #23 (merged to `main`, commit `92235e4`); L-06
+(Postgres service hardening) was already **fixed** on `main`; L-01 (`end_session` without
+`id_token_hint` silently revokes nothing) and L-04 (discovery advertises implicit/JWT-bearer
+capabilities the engine does not implement) are **fixed** in a follow-up change — L-01 by
+implementing `op.CanTerminateSessionFromRequest` to reject hint-less logout with a clear
+`invalid_request` instead of a false "signed out" (regression test
+`TestTerminateSessionFromRequestRequiresHint`), and L-04 by an `honestDiscovery` middleware that
+strips the unsupported `response_types_supported` / `grant_types_supported` entries from the served
+discovery document (regression test `TestHonestDiscovery`). This audit and these remediations do
+**not** satisfy criterion 12 and are **not** an independent external penetration test; production
+readiness remains NO-GO pending that and the remaining P1/P2 work.

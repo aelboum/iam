@@ -4,6 +4,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -191,7 +193,7 @@ func run() error {
 	if cfg.TrustProxy {
 		router.Use(forwardedFor(cfg.ProxyHops))
 	}
-	router.Use(middleware.Recoverer, securityHeaders, relaxCSPForFormPost, noStore, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
+	router.Use(middleware.Recoverer, securityHeaders, relaxCSPForFormPost, honestDiscovery, noStore, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
@@ -496,6 +498,104 @@ func formPostCSP(body []byte) (string, bool) {
 	origin := u.Scheme + "://" + u.Host
 	return "default-src 'none'; script-src 'unsafe-inline'; form-action " + origin +
 		"; base-uri 'none'; frame-ancestors 'none'", true
+}
+
+// discoveryPath is where the provider serves the OIDC discovery document.
+const discoveryPath = "/.well-known/openid-configuration"
+
+// discoveryDropResponseTypes and discoveryDropGrantTypes are the capabilities
+// zitadel/oidc hard-codes into every discovery document but this engine does not
+// implement: the implicit-flow response types, the implicit grant, and the JWT
+// bearer assertion grant (its key lookup is an unimplemented stub). The library
+// bakes these into op.ResponseTypes / op.GrantTypes and offers no config switch,
+// so a client built from the raw document would pick a flow that fails at
+// runtime (audit L-04). honestDiscovery strips them from the served document.
+var discoveryDropResponseTypes = map[string]bool{
+	"id_token": true, "id_token token": true,
+}
+var discoveryDropGrantTypes = map[string]bool{
+	"implicit": true, "urn:ietf:params:oauth:grant-type:jwt-bearer": true,
+}
+
+// honestDiscovery rewrites the discovery document so it advertises only the
+// response types and grant types the engine actually accepts (audit L-04). On
+// the discovery path it buffers the response, removes the unsupported entries
+// from response_types_supported and grant_types_supported, and serves the
+// result with every other field passed through untouched. If the body is not a
+// 200 JSON object it is served verbatim; the rewrite only ever removes
+// capabilities, never adds any, so it can never widen the advertised surface.
+func honestDiscovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSuffix(r.URL.Path, "/") != discoveryPath {
+			next.ServeHTTP(w, r)
+			return
+		}
+		dw := &deferredWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(dw, r)
+		body := dw.buf.Bytes()
+		if dw.status == http.StatusOK {
+			if rewritten, ok := rewriteDiscovery(body); ok {
+				body = rewritten
+				// deferredWriter wrote the body to a buffer, so the length
+				// changed; set it explicitly so a stale Content-Length from the
+				// library cannot truncate the rewritten document.
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			}
+		}
+		w.WriteHeader(dw.status)
+		_, _ = w.Write(body)
+	})
+}
+
+// rewriteDiscovery removes the unsupported response types and grant types from a
+// discovery document. It returns the rewritten JSON with ok=true when it changed
+// something, and ok=false (serve the original) when the body is not a JSON
+// object or nothing needed removing. Every field other than the two filtered
+// arrays is preserved.
+func rewriteDiscovery(body []byte) ([]byte, bool) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, false
+	}
+	changed := filterDiscoveryArray(doc, "response_types_supported", discoveryDropResponseTypes)
+	changed = filterDiscoveryArray(doc, "grant_types_supported", discoveryDropGrantTypes) || changed
+	if !changed {
+		return nil, false
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// filterDiscoveryArray removes drop-listed entries from the named string-array
+// field of a discovery document, rewriting it in place, and reports whether it
+// removed anything. A field that is absent or not a string array is left alone.
+func filterDiscoveryArray(doc map[string]json.RawMessage, field string, drop map[string]bool) bool {
+	raw, ok := doc[field]
+	if !ok {
+		return false
+	}
+	var vals []string
+	if err := json.Unmarshal(raw, &vals); err != nil {
+		return false
+	}
+	kept := make([]string, 0, len(vals))
+	for _, v := range vals {
+		if !drop[v] {
+			kept = append(kept, v)
+		}
+	}
+	if len(kept) == len(vals) {
+		return false
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return false
+	}
+	doc[field] = encoded
+	return true
 }
 
 // noStorePaths are responses that carry tokens or token-derived identity.
