@@ -182,6 +182,33 @@ func TestUserLockAndDeleteRevokeOnlyThatUsersTokens(t *testing.T) {
 	}
 }
 
+// Removing a second factor (TOTP or a passkey) may be a response to its
+// compromise, so the handler must revoke the user's issued tokens too, not just
+// end sessions, and must touch no other user (audit L-03). removeTOTP and
+// deletePasskey share the identical handler wiring; removeTOTP is exercised here
+// because it needs no seeded credential.
+func TestFactorRemovalRevokesTokens(t *testing.T) {
+	st, pool := revocationTestStore(t)
+	srv := &Server{store: st}
+	h := newRevHelper(t, st, pool)
+
+	org := h.org("org")
+	proj := h.project(org, "P")
+	client := h.app(proj)
+	userA := h.user(org)
+	userB := h.user(org)
+
+	a := h.token(client, userA.ID, nil)
+	b := h.token(client, userB.ID, nil)
+	rec := httptest.NewRecorder()
+	srv.removeTOTP(rec, adminReq(t, map[string]string{"userID": userA.ID}, nil))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("removeTOTP: status=%d body=%s, want 204", rec.Code, rec.Body.String())
+	}
+	h.mustGone("removeTOTP", a)
+	h.mustAlive("removeTOTP", b)
+}
+
 func TestSetPasswordHandlerRevokesOnlyTargetUser(t *testing.T) {
 	st, pool := revocationTestStore(t)
 	svc := authn.NewService(st, secret.NewBox([32]byte{23}), authn.Config{

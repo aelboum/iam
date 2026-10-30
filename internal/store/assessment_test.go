@@ -152,11 +152,32 @@ func TestDeleteIDPRevokesLinkedSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
+	// Seed an access + refresh token for the linked user so we can prove the IdP
+	// deletion revokes issued tokens, not just sessions (audit L-02).
+	atID, rtID := uuid.NewString(), uuid.NewString()
+	at := &AccessToken{
+		ID: atID, ClientID: "c-" + sfx, Subject: user.ID, Audience: []string{"c-" + sfx},
+		Scopes: []string{}, RefreshTokenID: &rtID, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	rt := &RefreshToken{
+		ID: rtID, TokenHash: uuid.NewString(), ClientID: "c-" + sfx, Subject: user.ID,
+		Audience: []string{"c-" + sfx}, Scopes: []string{}, AMR: []string{}, AuthTime: time.Now(),
+		AccessTokenID: &atID, ExpiresAt: time.Now().Add(24 * time.Hour), FamilyID: uuid.NewString(),
+	}
+	if err := st.CreateTokens(ctx, at, rt); err != nil {
+		t.Fatalf("create tokens: %v", err)
+	}
 	if err := st.DeleteIDP(ctx, org.ID, idp.ID); err != nil {
 		t.Fatalf("delete idp: %v", err)
 	}
 	if _, err := st.GetSession(ctx, sess.ID); err == nil {
 		t.Fatal("session survived IdP deletion")
+	}
+	if _, err := st.GetAccessToken(ctx, atID); err != ErrNotFound {
+		t.Fatalf("access token survived IdP deletion: err = %v, want ErrNotFound", err)
+	}
+	if _, err := st.GetRefreshTokenByID(ctx, rtID); err != ErrNotFound {
+		t.Fatalf("refresh token survived IdP deletion: err = %v, want ErrNotFound", err)
 	}
 	if err := st.DeleteIDP(ctx, org.ID, idp.ID); err != ErrNotFound {
 		t.Fatalf("second delete = %v, want ErrNotFound", err)
