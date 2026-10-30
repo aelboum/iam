@@ -197,10 +197,40 @@ restart, run `rotate-keys`, then `rotate-keys --check` (read-only; must report
 nothing still needs the old key), then remove the previous key after the access-
 token TTL. Everything issued before rotation keeps working until it expires.
 
+## Signing-key emergency revocation
+
+Scheduled signing-key rotation is automatic (a key signs for one rotation
+interval, then stays in the JWKS one more interval so its tokens stay
+verifiable). To retire a **leaked** signing key immediately instead of waiting
+for that lifetime, revoke it by id:
+
+```
+iamd revoke-key <key-id>
+```
+
+The `<key-id>` is the `kid` in a token's JWS header and in the JWKS at `/keys`
+(it equals the `signing_keys.id` row). After revocation:
+
+- Within one key-cache interval (~1 minute) every running instance drops the
+  key from `/keys` and stops signing with it; relying parties reject tokens it
+  signed once they refresh the JWKS.
+- If the revoked key was the active signer, a running engine promotes a
+  published successor or generates a new key on its next key reload, so signing
+  continues without operator action.
+- Access tokens already signed with the revoked key stop verifying — that is the
+  point; they are short-lived (access-token TTL) and clients re-authenticate.
+
+This does not rotate the master key. If the master key itself is suspect, follow
+the key-rotation procedure above as well.
+
 ## Incident response — credential compromise (runbook actions marked)
 
 - **Leaked master key:** rotate immediately (key-rotation procedure); treat all
   previously sealed secrets as exposed — rotate IdP client secrets too.
+- **Leaked signing key:** revoke it now with `iamd revoke-key <key-id>` (see
+  "Signing-key emergency revocation"); the key leaves the JWKS and its tokens are
+  rejected within ~1 minute, and a replacement signer is promoted/generated
+  automatically.
 - **Leaked login/instance-admin API key:** revoke the key (deleting a key also
   revokes keys it created); because a login key can trigger password resets for
   its users (residual risk D3 in SECURITY.md), review audit events for that key.

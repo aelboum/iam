@@ -376,6 +376,15 @@ func (s *Store) ListSigningKeys(ctx context.Context) ([]*SigningKey, error) {
 	return keys, mapErr(rows.Err())
 }
 
+// DeleteSigningKey permanently removes a signing key by id. It is the
+// emergency-revocation primitive (audit CRYPTO-05): once the row is gone,
+// ListSigningKeys no longer returns the key, so within one key-cache interval
+// every instance drops it from the published JWKS and relying parties reject
+// tokens it signed. Returns ErrNotFound if no such key exists.
+func (s *Store) DeleteSigningKey(ctx context.Context, id string) error {
+	return s.execOne(ctx, `DELETE FROM signing_keys WHERE id = $1`, id)
+}
+
 // LockSigningKeys takes a transaction-scoped advisory lock so only one
 // instance generates a new key at a time, then runs fn.
 func (s *Store) LockSigningKeys(ctx context.Context, fn func(ctx context.Context) error) error {

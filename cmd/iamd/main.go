@@ -56,6 +56,20 @@ func main() {
 		}
 		return
 	}
+	// `iamd revoke-key <key-id>` is the emergency response to a leaked signing
+	// key: it drops the key so every instance stops publishing and trusting it
+	// within one key-cache interval (audit CRYPTO-05).
+	if len(os.Args) > 1 && os.Args[1] == "revoke-key" {
+		if len(os.Args) < 3 || os.Args[2] == "" {
+			slog.Error("revoke-key needs a signing-key id: iamd revoke-key <key-id>")
+			os.Exit(2)
+		}
+		if err := revokeSigningKey(os.Args[2]); err != nil {
+			slog.Error("revoke-key failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "error", err)
 		os.Exit(1)
@@ -384,6 +398,35 @@ func purgeOnce() error {
 	}
 	slog.Info("purged expired rows", "tables", store.PurgedTables)
 	return st.PurgeRateLimits(ctx)
+}
+
+// revokeSigningKey is the emergency response to a leaked signing key (audit
+// CRYPTO-05). It drops the key from the database so that, within one key-cache
+// interval, every running instance stops publishing it in the JWKS and signing
+// with it, and relying parties reject the tokens it signed — bounding a leaked
+// key to minutes instead of its full lifetime. If this removed the last usable
+// key, a running engine promotes a published successor or generates a new key
+// on its next key reload, so signing continues.
+func revokeSigningKey(id string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := db.Migrate(ctx, pool); err != nil {
+		return err
+	}
+	st := store.New(pool)
+	if err := st.DeleteSigningKey(ctx, id); err != nil {
+		return err
+	}
+	slog.Warn("signing key revoked: it leaves the JWKS and stops being accepted within ~1 minute across all instances, and tokens it signed are then rejected. If it was the active signer, a running engine promotes a successor or generates a new key on its next reload.", "key_id", id)
+	return nil
 }
 
 // securityHeaders sets defensive headers on every response. The CSP is
