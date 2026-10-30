@@ -64,7 +64,8 @@ func (s *Store) GetAuthRequest(ctx context.Context, id string) (*AuthRequest, er
 }
 
 // GetAuthRequestByCode looks up an unused, unexpired authorization code
-// without consuming it.
+// without consuming it. The caller passes the SHA-256 of the code: the `code`
+// column stores that hash, not the code itself (audit N17).
 func (s *Store) GetAuthRequestByCode(ctx context.Context, code string) (*AuthRequest, error) {
 	return scanAuthRequest(s.pool.QueryRow(ctx, `
 		SELECT `+authRequestColumns+` FROM auth_requests
@@ -81,6 +82,8 @@ func (s *Store) ClaimAuthCode(ctx context.Context, authRequestID string) error {
 
 // SetAuthCode stores the authorization code, valid for ttl. Only a completed
 // request gets a code, and exactly one: repeated callbacks cannot replace it.
+// The caller passes the SHA-256 of the code; the `code` column holds that hash,
+// so a table read never yields a redeemable code (audit N17).
 func (s *Store) SetAuthCode(ctx context.Context, id, code string, ttl time.Duration) error {
 	return s.execOne(ctx, `
 		UPDATE auth_requests SET code = $2, code_expires_at = now() + make_interval(secs => $3)

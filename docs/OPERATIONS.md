@@ -124,13 +124,20 @@ get a slot within `IAM_HASH_WAIT_TIMEOUT` are shed with HTTP 503 (distinct from 
 ## Rate limiting
 
 Public, unauthenticated endpoints are rate limited **per client IP** (the IP is
-resolved per the trusted-proxy settings above). Exceeding a limit returns
-`429 Too Many Requests` with `Retry-After: 60` and a JSON `{"error":"slow_down"}`
-body. The limits (requests per minute / burst), from `limitOAuthEndpoints` in
-`cmd/iamd/main.go`:
+resolved per the trusted-proxy settings above). For IPv6 the bucket is keyed by
+the `/64` prefix, not the full address, because a provider routinely assigns one
+customer a whole `/64`; this stops an attacker defeating the limit by rotating
+through addresses inside their assignment. IPv4 is keyed by the full address.
+Exceeding a limit returns `429 Too Many Requests` with `Retry-After: 60` and a
+JSON `{"error":"too many requests, try again later"}` body. The limits (requests
+per minute / burst), from `limitOAuthEndpoints` in `cmd/iamd/main.go`:
 
-- `/oauth/token`, `/oauth/introspect`, `/revoke` — 120 / 60.
+- `/oauth/token`, `/oauth/introspect`, `/revoke`, `/userinfo`, `/end_session`,
+  `/device_authorization` — 120 / 60.
 - `/authorize`, `/authorize/callback` — 60 / 30.
+- `/keys` (JWKS) and `/.well-known/openid-configuration` (discovery) — 240 / 120.
+  These are cacheable metadata that every relying party fetches legitimately, so
+  they carry a wider budget while still bounding an unauthenticated flood.
 - `/idp/callback` (the federated-login callback) — 60 / 30. This endpoint is
   unauthenticated and hashes the `state` parameter and probes `idp_intents` on
   every call, so it carries the same per-IP limit as the other public endpoints

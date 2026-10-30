@@ -703,8 +703,13 @@ func cors(allowed []string) func(http.Handler) http.Handler {
 	}
 }
 
-// limitOAuthEndpoints rate-limits the token, introspection and revocation
-// endpoints per client IP, which slows client secret and code guessing.
+// limitOAuthEndpoints rate-limits the provider's public endpoints per client IP,
+// which slows client-secret and code guessing and bounds the DB-load and
+// crypto-work surface. Every unauthenticated provider endpoint is covered: the
+// token, introspection and revocation endpoints; userinfo; end_session and the
+// device-authorization endpoint; authorize and its callback; the federated-login
+// callback; and the cacheable metadata endpoints (JWKS and discovery) on a more
+// generous budget (audit I-05).
 func limitOAuthEndpoints(limits ratelimit.Factory) func(http.Handler) http.Handler {
 	limiter := limits("oauth", 120, 60)
 	// /authorize stores a pending request per call, so it is limited too.
@@ -713,21 +718,25 @@ func limitOAuthEndpoints(limits ratelimit.Factory) func(http.Handler) http.Handl
 	// hashes the state and probes idp_intents, so limit it per IP like the other
 	// public OAuth endpoints rather than leave it as an unthrottled DB-load vector.
 	callbackLimiter := limits("idp-callback", 60, 30)
+	// Discovery and JWKS are cacheable GET metadata that every relying party
+	// fetches legitimately (JWKS on each key rotation), so they get a wider budget
+	// than the OAuth endpoints while still bounding an unauthenticated flood.
+	metadataLimiter := limits("oauth-metadata", 240, 120)
 	limited := map[string]ratelimit.Allower{
 		"/oauth/token": limiter, "/oauth/introspect": limiter, "/revoke": limiter,
-		"/userinfo":  limiter,
-		"/authorize": authorizeLimiter, "/authorize/callback": authorizeLimiter,
+		"/userinfo":             limiter,
+		"/end_session":          limiter,
+		"/device_authorization": limiter,
+		"/authorize":            authorizeLimiter, "/authorize/callback": authorizeLimiter,
 		authn.CallbackPath: callbackLimiter,
+		"/keys":            metadataLimiter,
+		discoveryPath:      metadataLimiter,
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Trim a trailing slash so /oauth/token/ is limited like /oauth/token.
 			if l := limited[strings.TrimSuffix(r.URL.Path, "/")]; l != nil {
-				host, _, err := net.SplitHostPort(r.RemoteAddr)
-				if err != nil {
-					host = r.RemoteAddr
-				}
-				if !l.Allow(host) {
+				if !l.Allow(limiterKey(r.RemoteAddr)) {
 					w.Header().Set("Retry-After", "60")
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusTooManyRequests)
@@ -738,6 +747,26 @@ func limitOAuthEndpoints(limits ratelimit.Factory) func(http.Handler) http.Handl
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// limiterKey derives the rate-limit bucket for a request's source address. IPv6
+// providers routinely assign a single customer a whole /64, so an attacker can
+// rotate through 2^64 addresses to defeat a per-address limit; collapsing IPv6
+// to its /64 prefix keeps one client on one bucket. IPv4 keeps its full address,
+// and an unparseable address falls back to the raw host string (audit N10).
+func limiterKey(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return host
+	}
+	if ip.To4() != nil {
+		return ip.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // purgeLoop periodically deletes expired auth requests, tokens, sessions and keys.

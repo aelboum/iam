@@ -272,6 +272,71 @@ discovery document (regression test `TestHonestDiscovery`). This audit and these
 **not** satisfy criterion 12 and are **not** an independent external penetration test; production
 readiness remains NO-GO pending that and the remaining P1/P2 work.
 
+**Wave 3 — P3-8 rate-limit coverage (2026-10-30).** Per the remediation roadmap
+(SECURITY_REMEDIATION_ROADMAP.md P3-8, findings I-05/N10), the per-IP rate
+limiter in `cmd/iamd/main.go` now covers every public provider endpoint that was
+previously unthrottled: `/userinfo`, `/end_session` and `/device_authorization`
+share the OAuth budget (120/60), and the cacheable metadata endpoints `/keys`
+(JWKS) and `/.well-known/openid-configuration` (discovery) get a wider budget
+(240/120) so legitimate relying-party polling is not broken. IPv6 sources are now
+keyed by their `/64` prefix instead of the full address, so an attacker cannot
+defeat the limit by rotating through the addresses of a single assignment (N10);
+IPv4 is unchanged. Regression tests (`TestOAuthLimiterCoversAllProviderEndpoints`,
+`TestLimiterKeyCollapsesIPv6To64`, `TestOAuthLimiterSharesIPv6Slash64Bucket`) and
+the operator docs (OPERATIONS.md) are updated. This is a hardening change only; it
+does not satisfy criterion 12 and does not change the overall status — production
+readiness remains NO-GO.
+
+**Wave 3 — P2-6 supply chain: SBOM + Action digest pinning (2026-10-30).** Per the
+remediation roadmap (SECURITY_REMEDIATION_ROADMAP.md P2-6, findings SUPPLY-05/06/07):
+the CI pipeline now emits a **CycloneDX SBOM** of the runtime image (its OS packages
+and the Go module list baked into the binary) as a build artifact (`sbom.cdx.json`),
+and **every third-party GitHub Action is pinned to an immutable commit SHA** with its
+version in a trailing comment (`actions/checkout`, `actions/setup-go`,
+`actions/setup-python`, `actions/upload-artifact`). A `.github/dependabot.yml`
+(github-actions, weekly) keeps those pins current so pinning does not freeze out
+upstream security fixes. **Deliberately deferred** (recorded, not silently dropped):
+*image* base-layer digest pinning stays off because the deployment intentionally uses
+floating minor base tags so a rebuild picks up upstream fixes without a bump bot
+(consistent with the earlier image-scan decision); and **release signing + SLSA
+provenance (`cosign`)** is deferred because the repo has no artifact-publish/release
+pipeline yet — there is nothing published to sign, and a keyless-signing/registry setup
+is an owner/deploy decision, not an autonomous CI change. This is a supply-chain
+hardening change only; it does not satisfy criterion 12 and does not change the overall
+status — production readiness remains NO-GO.
+
+**Wave 3 — P3-7 (part 1) hash authorization codes at rest (2026-10-30).** Per the
+remediation roadmap (SECURITY_REMEDIATION_ROADMAP.md P3-7, finding N17): the OIDC
+authorization code is now stored as its SHA-256. The code the library persists is
+already an op-crypto (AES-GCM) ciphertext, so the `auth_requests.code` column was never
+plaintext; hashing it additionally means a reader of that table who **also** holds the
+master key (and could therefore decrypt the op-crypto layer) still cannot recover a
+redeemable code. `SaveAuthCode` hashes before writing and `AuthRequestByCode` hashes
+before the lookup (`internal/oidcop/storage.go`), the same treatment refresh tokens
+already get. Codes are high-entropy, so a plain hash suffices. Regression test
+`TestAuthCodeStoredHashedAtRest` (the column holds the hash, the code round-trips, the
+stored hash is not itself usable as a code). The HKDF half of P3-7
+(CRYPTO-06, use HKDF in `secret.Derive`) is **not** included here: it changes the key
+derivation for the master key and would need a backward-compatibility path so existing
+sealed data still opens, so it is sequenced as its own change. This is a hardening change
+only; it does not satisfy criterion 12 and does not change the overall status — production
+readiness remains NO-GO.
+
+**Wave 3 — P3-7 (part 2) CRYPTO-06 dispositioned as accepted (2026-10-30).** The HKDF
+half of P3-7 (use HKDF in `secret.Derive`) was reviewed with the owner and **accepted
+without change**. The current derivation `SHA-256(master ‖ purpose)` is cryptographically
+sound for this use: the master key is a uniformly-random 32-byte secret, the purpose
+label gives domain separation, and a secret-keyed hash truncated to 32 bytes is not
+length-extensible in any attacker-usable way. Adopting HKDF would be a standards-alignment
+change only, and switching the derivation would re-key every derived secret (the at-rest
+`Box`, the email-code HMAC, the op-crypto key), requiring a backward-compatibility path for
+existing sealed data — a breaking change to the crypto root whose marginal hygiene benefit
+does not justify it on a pre-release system. Recorded in SECURITY.md (register row
+CRYPTO-06, owner-accepted). The residual-risk register was also reconciled with the Wave 3
+fixes: N10 (IPv6 /64 keying) → Fixed (PR #25), N17 (hash authorization codes) → Fixed
+(PR #27). This disposition changes no code and does not change the overall status —
+production readiness remains NO-GO.
+
 **Wave 3 — P2-7 emergency signing-key revocation (2026-10-30).** Per the remediation
 roadmap (SECURITY_REMEDIATION_ROADMAP.md P2-7, finding CRYPTO-05): an operator can now
 retire a leaked signing key immediately instead of waiting for its full lifetime, with
