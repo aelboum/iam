@@ -42,6 +42,11 @@ Optional (default in parentheses, from `config.go`):
 - Passkeys: `IAM_WEBAUTHN_RP_ID` (defaults to the issuer host),
   `IAM_WEBAUTHN_ORIGINS` (defaults to the issuer origin) — set both to the login
   UI's real domain and origin(s); invalid values fail fast at boot.
+- `IAM_WEAK_PASSWORD_FILE` — optional path to an extra breached/common-password
+  denylist (one password per line, `#` comments allowed), merged into the
+  built-in list at startup. A configured-but-unreadable file is fatal at boot.
+  Drop in a larger offline corpus (for example the Have I Been Pwned "Pwned
+  Passwords" top-N export) to extend coverage without rebuilding.
 
 Boolean variables (`IAM_DEV_MODE`, `IAM_ENABLE_DOCS`, `IAM_TRUST_PROXY`,
 `IAM_SHARED_RATE_LIMITS`, `IAM_STRICT_SIZING`) are enabled **only** by the exact
