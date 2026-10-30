@@ -272,6 +272,39 @@ discovery document (regression test `TestHonestDiscovery`). This audit and these
 **not** satisfy criterion 12 and are **not** an independent external penetration test; production
 readiness remains NO-GO pending that and the remaining P1/P2 work.
 
+**Wave 3 — P3-8 rate-limit coverage (2026-10-30).** Per the remediation roadmap
+(SECURITY_REMEDIATION_ROADMAP.md P3-8, findings I-05/N10), the per-IP rate
+limiter in `cmd/iamd/main.go` now covers every public provider endpoint that was
+previously unthrottled: `/userinfo`, `/end_session` and `/device_authorization`
+share the OAuth budget (120/60), and the cacheable metadata endpoints `/keys`
+(JWKS) and `/.well-known/openid-configuration` (discovery) get a wider budget
+(240/120) so legitimate relying-party polling is not broken. IPv6 sources are now
+keyed by their `/64` prefix instead of the full address, so an attacker cannot
+defeat the limit by rotating through the addresses of a single assignment (N10);
+IPv4 is unchanged. Regression tests (`TestOAuthLimiterCoversAllProviderEndpoints`,
+`TestLimiterKeyCollapsesIPv6To64`, `TestOAuthLimiterSharesIPv6Slash64Bucket`) and
+the operator docs (OPERATIONS.md) are updated. This is a hardening change only; it
+does not satisfy criterion 12 and does not change the overall status — production
+readiness remains NO-GO.
+
+**Wave 3 — P2-6 supply chain: SBOM + Action digest pinning (2026-10-30).** Per the
+remediation roadmap (SECURITY_REMEDIATION_ROADMAP.md P2-6, findings SUPPLY-05/06/07):
+the CI pipeline now emits a **CycloneDX SBOM** of the runtime image (its OS packages
+and the Go module list baked into the binary) as a build artifact (`sbom.cdx.json`),
+and **every third-party GitHub Action is pinned to an immutable commit SHA** with its
+version in a trailing comment (`actions/checkout`, `actions/setup-go`,
+`actions/setup-python`, `actions/upload-artifact`). A `.github/dependabot.yml`
+(github-actions, weekly) keeps those pins current so pinning does not freeze out
+upstream security fixes. **Deliberately deferred** (recorded, not silently dropped):
+*image* base-layer digest pinning stays off because the deployment intentionally uses
+floating minor base tags so a rebuild picks up upstream fixes without a bump bot
+(consistent with the earlier image-scan decision); and **release signing + SLSA
+provenance (`cosign`)** is deferred because the repo has no artifact-publish/release
+pipeline yet — there is nothing published to sign, and a keyless-signing/registry setup
+is an owner/deploy decision, not an autonomous CI change. This is a supply-chain
+hardening change only; it does not satisfy criterion 12 and does not change the overall
+status — production readiness remains NO-GO.
+
 **Wave 3 — P3-7 (part 1) hash authorization codes at rest (2026-10-30).** Per the
 remediation roadmap (SECURITY_REMEDIATION_ROADMAP.md P3-7, finding N17): the OIDC
 authorization code is now stored as its SHA-256. The code the library persists is
