@@ -132,6 +132,13 @@ key and sending the browser's IP in `X-End-User-IP`. The engine never renders HT
 4. Your login UI redirects the browser to `callback_url`. The engine then redirects to `redirect_uri?code=...`.
 5. The SaaS exchanges the code at `POST /oauth/token`.
 
+**Org MFA policy.** An org admin can require MFA for all its users with
+`PUT /v1/orgs/{orgID}/mfa-policy` `{"mfa_required": true}`. When set, a user with
+no second factor can still verify a first factor, but the session reports
+`mfa_enrollment_required: true` and cannot finalize: enrol a factor for them
+(`POST /v1/users/{id}/totp` + verify, or a passkey) and complete the second-factor
+step first.
+
 Other ways to authenticate the session in step 3:
 
 - **Passkey (passwordless):** `POST /v1/sessions/{sid}/passkey/begin` gives options for

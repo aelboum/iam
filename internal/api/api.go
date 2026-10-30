@@ -91,6 +91,7 @@ func (s *Server) Routes() http.Handler {
 			r.Route("/{orgID}", func(r chi.Router) {
 				r.Use(requireOrgAccess)
 				r.Get("/", s.getOrg)
+				r.Put("/mfa-policy", s.setOrgMFAPolicy)
 				r.With(requireInstanceAdmin).Delete("/", s.deleteOrg)
 				r.Post("/api-keys", s.createAPIKey)
 				r.Get("/api-keys", s.listAPIKeys)
