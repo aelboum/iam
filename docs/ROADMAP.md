@@ -200,13 +200,13 @@ executable checklist in [EXTERNAL_VALIDATION.md](EXTERNAL_VALIDATION.md).
 
 ## Production-readiness matrix
 
-Authoritative status as of commit `1d48e51` (CI `test`/`e2e`/`security` green).
+Authoritative status as of commit `323075c` (CI `test`/`e2e`/`security`/`image-scan` green).
 
 | # | Criterion | Status | Evidence |
 |---|-----------|--------|----------|
 | 1 | No unresolved Critical/High security findings | **PASS** | SECURITY.md; three independent reviews, none open above Low |
-| 2 | Every Medium fixed or dispositioned | **PASS** | No Medium open; D3 accepted-by-design (SECURITY.md register) |
-| 3 | Required CI jobs pass on the final commit | **PASS** | `1d48e51`: `test`, `e2e`, `security` success |
+| 2 | Every Medium fixed or dispositioned | **PASS (1 item pending)** | D3 accepted-by-design (SECURITY.md register). The 2026-10-29 internal audit (docs/security/INTERNAL_SECURITY_AUDIT.md) found two further Medium items: container `mem_limit` is now fixed in the prod/staging compose files; the CSP/`form_post` item remains **open** on `323075c` and awaits owner disposition — see the reconciliation note below. |
+| 3 | Required CI jobs pass on the final commit | **PASS** | `323075c`: `test`, `e2e`, `security`, `image-scan` success |
 | 4 | Migration/upgrade paths tested | **PASS** | WS4; `migration_rehearsal.sh` ALL_PASS (local + staging) |
 | 5 | Backup/restore + recovery with reproducible evidence | **PASS** | EXTERNAL_VALIDATION §4; 4.90s (empty) and 8.73s (71 MB synthetic) |
 | 6 | Rollback criteria documented and rehearsed | **PASS** | STAGING.md; disposable rehearsal 2026-10-26 (B2) |
@@ -218,15 +218,17 @@ Authoritative status as of commit `1d48e51` (CI `test`/`e2e`/`security` green).
 | 12 | Independent external penetration test completed | **NOT PERFORMED — WAIVED (risk accepted by owner, 2026-10-28)** | No independent engagement performed; the owner has deliberately waived this gate and accepted the risk — see SECURITY.md "Waived gate" entry (register W1). This is a waiver, **not** a pass; internal and AI-assisted audits remain explicitly **not** a substitute (PENTEST.md). Tester selection/brief retained should the owner reverse: PENTEST_VENDOR_SELECTION.md. |
 | 13 | Operational monitoring / IR / recovery documented | **PASS** | OPERATIONS.md, DEPLOYMENT.md (WS8) |
 | 14 | Every exception/residual risk explicit and reviewed | **PASS** | SECURITY.md residual register N1–N20 |
-| 15 | Final code, docs, migrations, config, CI agree | **PASS** | Reconciled; CI green on `1d48e51` |
+| 15 | Final code, docs, migrations, config, CI agree | **PASS** | Reconciled; CI green on `323075c` |
 
 **Overall: `NO-GO — PENDING OWNER RELEASE AUTHORIZATION`.** Every technical gate that can
-be satisfied internally has passed with evidence on `1d48e51`. The one mandatory gate that
+be satisfied internally has passed with evidence on `323075c`. The one mandatory gate that
 cannot be satisfied internally — **criterion 12, an independent external penetration test** —
 has been **waived by the owner** (2026-10-28), who formally accepted the risk of releasing
 without it (SECURITY.md, register W1 and the "Waived gate" subsection); it is recorded as
 **NOT PERFORMED — WAIVED**, not passed, and internal/AI-assisted testing is still not
-represented as equivalent. With that gate waived, no *technical* gate remains blocking, but
+represented as equivalent. With that gate waived, one *technical* item remains open — the
+CSP/`form_post` Medium from the 2026-10-29 internal audit (see the reconciliation note below),
+pending owner disposition — and
 production stays **NO-GO** until the owner **explicitly authorizes release** and the production
 hardening follow-ups (stable DNS instead of the ephemeral tunnel, a managed secret store, DB
 TLS, bootstrap-admin rotation — step-by-step runbook with verification and rollback:
@@ -242,3 +244,23 @@ smoke + feature suites) but are **not yet committed**. This internal hardening
 does **not** satisfy criterion 12 and does **not** change the overall status:
 production remains **NO-GO** pending the independent external penetration test,
 its remediation, and retest.
+
+**Reconciliation note (2026-10-30).** The matrix pin advanced from `1d48e51` to `323075c`.
+Eight pull requests merged in between, each with CI green: deploy-hardening follow-ups
+(#14), a Trivy image/config scan CI job (#15, #16), a production plaintext-database-URL
+warning (#16), mandatory PKCE for every interactive client (#17), a breached/common
+password denylist (#18), org-level MFA enforcement with an enrollment gate (#19), and MFA
+backup/recovery codes (#20). A fourth internal, source-first audit (2026-10-29,
+docs/security/INTERNAL_SECURITY_AUDIT.md) reviewed commit `2f78ab6` and found **no Critical
+and no High**, two Medium, six Low, and eight Informational. Of the two Medium items: the
+missing container `mem_limit` (which left the N12 sizing guard disengaged) is **fixed** —
+`docker-compose.prod.yml` and `docker-compose.staging.yml` now set `mem_limit: 1g`; the
+global CSP (`default-src 'none'; … form-action 'self'`) that breaks `response_mode=form_post`
+for relying parties is **still open** on `323075c` (verified: `securityHeaders` is global
+middleware in `cmd/iamd/main.go` and the OIDC provider is mounted at `/`, so the policy
+covers authorize responses). This item is tracked against criterion 2 and awaits an owner
+decision — fix (scope the CSP off the provider mount, or allow the nonce'd auto-submit) or
+disposition (declare `form_post` unsupported). The six Low items (logout/factor-removal token
+semantics, discovery drift, session-token transport, Postgres service hardening) remain to be
+dispositioned. This audit does **not** satisfy criterion 12 and is **not** an independent
+external penetration test.
