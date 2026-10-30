@@ -73,6 +73,7 @@ penetration test).
 | `IAM_MASTER_KEY_PREVIOUS` | Old master key(s), comma-separated, accepted for decryption during a rotation. |
 | `IAM_SHARED_RATE_LIMITS` | `true` counts rate limits in Postgres across all instances. |
 | `IAM_WEBAUTHN_RP_ID`, `IAM_WEBAUTHN_ORIGINS` | Passkey domain and login UI origin(s). Default: the issuer's host and origin. |
+| `IAM_WEAK_PASSWORD_FILE` | Optional path to an extra breached/common-password denylist (one per line) merged into the built-in list at startup. |
 
 ## API
 
@@ -130,6 +131,13 @@ key and sending the browser's IP in `X-End-User-IP`. The engine never renders HT
    - `POST /v1/auth-requests/{id}/finalize` `{"session_id","session_token"}` to get `callback_url`.
 4. Your login UI redirects the browser to `callback_url`. The engine then redirects to `redirect_uri?code=...`.
 5. The SaaS exchanges the code at `POST /oauth/token`.
+
+**Org MFA policy.** An org admin can require MFA for all its users with
+`PUT /v1/orgs/{orgID}/mfa-policy` `{"mfa_required": true}`. When set, a user with
+no second factor can still verify a first factor, but the session reports
+`mfa_enrollment_required: true` and cannot finalize: enrol a factor for them
+(`POST /v1/users/{id}/totp` + verify, or a passkey) and complete the second-factor
+step first.
 
 **Backup / recovery codes.** Generate a set of single-use codes for a user with
 `POST /v1/users/{id}/recovery-codes` (returned once; regenerating replaces the set).

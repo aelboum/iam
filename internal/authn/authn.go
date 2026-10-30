@@ -147,6 +147,12 @@ func CheckPasswordPolicy(password, username, email string) error {
 			return WeakPasswordError("password must not contain the username or email")
 		}
 	}
+	// Reject passwords on the breached/common-password denylist (security
+	// follow-up #1). The length check above already blocks the shortest
+	// classics; this catches common passwords long enough to pass it.
+	if isWeakPassword(password) {
+		return WeakPasswordError("password is too common or has appeared in a known breach; choose a different one")
+	}
 	return nil
 }
 
@@ -399,6 +405,10 @@ type SessionState struct {
 	// Only revealed once the password was verified.
 	OrgID  string `json:"org_id,omitempty"`
 	UserID string `json:"user_id,omitempty"`
+	// MFAEnrollmentRequired is true when the user's org mandates MFA, a first
+	// factor has been verified, but the user has no second factor enrolled, so
+	// the login cannot complete until they enrol TOTP or a passkey (follow-up #2).
+	MFAEnrollmentRequired bool `json:"mfa_enrollment_required,omitempty"`
 }
 
 // Client describes who is calling: the org an API key is restricted to
@@ -463,7 +473,11 @@ func (s *Service) GetSession(ctx context.Context, c Client, id, token string) (*
 	if err != nil {
 		return nil, err
 	}
-	return s.state(sess, user), nil
+	orgMFA, hasFactor, err := s.mfaInputs(ctx, user)
+	if err != nil {
+		return nil, err
+	}
+	return s.state(sess, user, orgMFA, hasFactor), nil
 }
 
 func (s *Service) CheckPassword(ctx context.Context, c Client, id, token, password string) (*SessionState, error) {
@@ -792,7 +806,29 @@ func (s *Service) DeleteSession(ctx context.Context, c Client, id, token string)
 	return s.store.DeleteSession(ctx, id)
 }
 
-func (s *Service) state(sess *store.Session, user *store.User) *SessionState {
+// mfaInputs loads the two facts the session state needs beyond the session row:
+// whether the user's org mandates MFA, and whether the user already has a second
+// factor enrolled (verified TOTP or a registered passkey). Meaningful only once
+// a user is known (security follow-up #2).
+func (s *Service) mfaInputs(ctx context.Context, user *store.User) (orgMFARequired, hasEnrolledFactor bool, err error) {
+	if user == nil {
+		return false, false, nil
+	}
+	org, err := s.store.GetOrg(ctx, user.OrgID)
+	if err != nil {
+		return false, false, err
+	}
+	if user.TOTPVerified {
+		return org.MFARequired, true, nil
+	}
+	hasPasskey, err := s.store.UserHasPasskey(ctx, user.ID)
+	if err != nil {
+		return false, false, err
+	}
+	return org.MFARequired, hasPasskey, nil
+}
+
+func (s *Service) state(sess *store.Session, user *store.User, orgMFARequired, hasEnrolledFactor bool) *SessionState {
 	known := user != nil
 	st := &SessionState{
 		ID:              sess.ID,
@@ -806,7 +842,9 @@ func (s *Service) state(sess *store.Session, user *store.User) *SessionState {
 	// Nothing about the user is revealed before a first factor was verified.
 	if st.PasswordChecked || st.PasskeyChecked || st.IDPChecked {
 		st.OrgID, st.UserID = sess.OrgID, user.ID
-		st.MFARequired = user.MFARequired()
+		// MFA is required if the user enrolled a second factor, or the org
+		// mandates one for all its users (security follow-up #2).
+		st.MFARequired = user.MFARequired() || orgMFARequired
 	}
 	// A session is authenticated by one of: a user-verified passkey (phishing
 	// resistant, counts as multi-factor), a federated login (plus TOTP when
@@ -858,6 +896,14 @@ func (s *Service) state(sess *store.Session, user *store.User) *SessionState {
 	if at != nil {
 		t := *at
 		st.Authenticated, st.AuthTime = true, &t
+	}
+	// An org that mandates MFA blocks a user who has verified a first factor but
+	// has no second factor to use: the login cannot complete until they enrol
+	// one. (A user who HAS a factor but has not used it yet is simply not
+	// authenticated, with MFARequired already signalling the pending step.)
+	if orgMFARequired && !st.Authenticated && !hasEnrolledFactor &&
+		(st.PasswordChecked || st.IDPChecked) {
+		st.MFAEnrollmentRequired = true
 	}
 	return st
 }
@@ -930,7 +976,11 @@ func (s *Service) FinalizeAuthRequest(ctx context.Context, c Client, authRequest
 	if user.Locked {
 		return ErrLocked
 	}
-	state := s.state(sess, user)
+	orgMFA, hasFactor, err := s.mfaInputs(ctx, user)
+	if err != nil {
+		return err
+	}
+	state := s.state(sess, user, orgMFA, hasFactor)
 	if !state.Authenticated {
 		return ErrNotAuthenticated
 	}

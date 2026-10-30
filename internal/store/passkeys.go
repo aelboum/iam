@@ -35,6 +35,16 @@ func (s *Store) ListPasskeys(ctx context.Context, userID string) ([]*Passkey, er
 	return keys, mapErr(rows.Err())
 }
 
+// UserHasPasskey reports whether the user has at least one registered passkey.
+// Used to decide whether an MFA-required org still needs the user to enrol a
+// factor (security follow-up #2).
+func (s *Store) UserHasPasskey(ctx context.Context, userID string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM webauthn_credentials WHERE user_id = $1)`, userID).Scan(&exists)
+	return exists, mapErr(err)
+}
+
 func (s *Store) AddPasskey(ctx context.Context, id, userID, name string, credential []byte) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO webauthn_credentials (id, user_id, name, credential) VALUES ($1, $2, $3, $4)`,

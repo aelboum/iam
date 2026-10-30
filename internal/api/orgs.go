@@ -61,6 +61,27 @@ func (s *Server) getOrg(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, org)
 }
 
+func (s *Server) setOrgMFAPolicy(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "orgID")
+	var body struct {
+		MFARequired bool `json:"mfa_required"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if err := s.store.SetOrgMFARequired(r.Context(), id, body.MFARequired); err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, id, "org.mfa_policy_changed", "org:"+id, map[string]any{"mfa_required": body.MFARequired})
+	org, err := s.store.GetOrg(r.Context(), id)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, org)
+}
+
 func (s *Server) deleteOrg(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "orgID")
 	// Revoke first: the token lookup needs the org's users to still exist.

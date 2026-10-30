@@ -12,16 +12,24 @@ type Org struct {
 	Name      string    `json:"name"`
 	Slug      string    `json:"slug"`
 	CreatedAt time.Time `json:"created_at"`
+	// MFARequired, when true, forces every user of this org to have and use a
+	// second factor to complete a login (security follow-up #2).
+	MFARequired bool `json:"mfa_required"`
 }
 
-const orgColumns = `id, name, slug, created_at`
+const orgColumns = `id, name, slug, created_at, mfa_required`
 
 func scanOrg(row interface{ Scan(...any) error }) (*Org, error) {
 	var o Org
-	if err := row.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedAt); err != nil {
+	if err := row.Scan(&o.ID, &o.Name, &o.Slug, &o.CreatedAt, &o.MFARequired); err != nil {
 		return nil, mapErr(err)
 	}
 	return &o, nil
+}
+
+// SetOrgMFARequired sets the org-level MFA enforcement policy.
+func (s *Store) SetOrgMFARequired(ctx context.Context, id string, required bool) error {
+	return s.execOne(ctx, `UPDATE orgs SET mfa_required = $2 WHERE id = $1`, id, required)
 }
 
 func (s *Store) CreateOrg(ctx context.Context, name, slug string) (*Org, error) {

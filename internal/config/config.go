@@ -77,6 +77,11 @@ type Config struct {
 	// CORSOrigins are the browser origins allowed to call the API directly.
 	// Empty means no CORS headers (the API is normally called server-to-server).
 	CORSOrigins []string
+
+	// WeakPasswordFile optionally points at an operator-supplied breached/common
+	// password denylist (one password per line) merged into the embedded list at
+	// startup. Empty uses only the embedded list.
+	WeakPasswordFile string
 }
 
 func Load() (*Config, error) {
@@ -86,6 +91,7 @@ func Load() (*Config, error) {
 		DatabaseURL:       os.Getenv("IAM_DATABASE_URL"),
 		BootstrapAdminKey: os.Getenv("IAM_BOOTSTRAP_ADMIN_KEY"),
 		DevMode:           os.Getenv("IAM_DEV_MODE") == "true",
+		WeakPasswordFile:  os.Getenv("IAM_WEAK_PASSWORD_FILE"),
 		TrustProxy:        os.Getenv("IAM_TRUST_PROXY") == "true",
 		SharedRateLimits:  os.Getenv("IAM_SHARED_RATE_LIMITS") == "true",
 		MaxFailedLogins:   5,

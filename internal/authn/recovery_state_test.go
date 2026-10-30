@@ -19,7 +19,9 @@ func TestStateRecoveryCodeSatisfiesMFA(t *testing.T) {
 	withRecovery := &store.Session{
 		ID: "s1", OrgID: "o1", PasswordCheckedAt: &now, RecoveryCheckedAt: &now, ExpiresAt: now.Add(time.Hour),
 	}
-	st := svc.state(withRecovery, user)
+	// orgMFARequired=false (the user's enrolled TOTP already makes MFA required),
+	// hasEnrolledFactor=true.
+	st := svc.state(withRecovery, user, false, true)
 	if !st.Authenticated {
 		t.Fatal("a recovery code should authenticate an MFA-required user")
 	}
@@ -29,7 +31,7 @@ func TestStateRecoveryCodeSatisfiesMFA(t *testing.T) {
 
 	// Password alone (MFA required, no second factor) does not authenticate.
 	passwordOnly := &store.Session{ID: "s2", OrgID: "o1", PasswordCheckedAt: &now, ExpiresAt: now.Add(time.Hour)}
-	if svc.state(passwordOnly, user).Authenticated {
+	if svc.state(passwordOnly, user, false, true).Authenticated {
 		t.Error("password alone must not authenticate an MFA-required user")
 	}
 }
