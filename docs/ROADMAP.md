@@ -345,10 +345,10 @@ retire a leaked signing key immediately instead of waiting for its full lifetime
 instance drops the key from the published JWKS (`/keys`) and stops signing with it, and
 relying parties reject tokens it signed once they refresh the JWKS. If the revoked key was
 the active signer, the running engine promotes a published successor or generates a new key
-on its next key reload, so signing continues without operator action. Regression tests
-`store.TestDeleteSigningKeyRemovesFromList` (revoked key leaves `ListSigningKeys`; unknown
-id → `ErrNotFound`) and `oidcop.TestRevokedKeyLeavesJWKSAndResigns` (revoked key leaves the
-JWKS and the key store still returns a usable signer). The ≤1-minute propagation bound and
-the runbook are documented in OPERATIONS.md. This is a hardening change only; it does not
+on its next key reload, so signing continues without operator action. Regression test
+`store.TestDeleteSigningKeyRemovesFromList` (a revoked key leaves `ListSigningKeys` — the
+query that feeds the published JWKS — while a sibling key survives; an unknown id →
+`ErrNotFound`). The ≤1-minute propagation bound and the runbook are documented in
+OPERATIONS.md. This is a hardening change only; it does not
 satisfy criterion 12 and does not change the overall status — production readiness remains
 NO-GO.
