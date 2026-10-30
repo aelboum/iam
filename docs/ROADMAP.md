@@ -271,3 +271,18 @@ strips the unsupported `response_types_supported` / `grant_types_supported` entr
 discovery document (regression test `TestHonestDiscovery`). This audit and these remediations do
 **not** satisfy criterion 12 and are **not** an independent external penetration test; production
 readiness remains NO-GO pending that and the remaining P1/P2 work.
+
+**Wave 3 — P3-7 (part 2) CRYPTO-06 dispositioned as accepted (2026-10-30).** The HKDF
+half of P3-7 (use HKDF in `secret.Derive`) was reviewed with the owner and **accepted
+without change**. The current derivation `SHA-256(master ‖ purpose)` is cryptographically
+sound for this use: the master key is a uniformly-random 32-byte secret, the purpose
+label gives domain separation, and a secret-keyed hash truncated to 32 bytes is not
+length-extensible in any attacker-usable way. Adopting HKDF would be a standards-alignment
+change only, and switching the derivation would re-key every derived secret (the at-rest
+`Box`, the email-code HMAC, the op-crypto key), requiring a backward-compatibility path for
+existing sealed data — a breaking change to the crypto root whose marginal hygiene benefit
+does not justify it on a pre-release system. Recorded in SECURITY.md (register row
+CRYPTO-06, owner-accepted). The residual-risk register was also reconciled with the Wave 3
+fixes: N10 (IPv6 /64 keying) → Fixed (PR #25), N17 (hash authorization codes) → Fixed
+(PR #27). This disposition changes no code and does not change the overall status —
+production readiness remains NO-GO.
