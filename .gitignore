@@ -8,3 +8,5 @@ examples/demo/.demo-state.json
 *.log
 *.dump
 __pycache__/
+# Raw output from the strix pentest tool — evidence artifacts, not source.
+strix_runs/
