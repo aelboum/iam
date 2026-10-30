@@ -73,6 +73,7 @@ penetration test).
 | `IAM_MASTER_KEY_PREVIOUS` | Old master key(s), comma-separated, accepted for decryption during a rotation. |
 | `IAM_SHARED_RATE_LIMITS` | `true` counts rate limits in Postgres across all instances. |
 | `IAM_WEBAUTHN_RP_ID`, `IAM_WEBAUTHN_ORIGINS` | Passkey domain and login UI origin(s). Default: the issuer's host and origin. |
+| `IAM_WEAK_PASSWORD_FILE` | Optional path to an extra breached/common-password denylist (one per line) merged into the built-in list at startup. |
 
 ## API
 

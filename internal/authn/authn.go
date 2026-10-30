@@ -147,6 +147,12 @@ func CheckPasswordPolicy(password, username, email string) error {
 			return WeakPasswordError("password must not contain the username or email")
 		}
 	}
+	// Reject passwords on the breached/common-password denylist (security
+	// follow-up #1). The length check above already blocks the shortest
+	// classics; this catches common passwords long enough to pass it.
+	if isWeakPassword(password) {
+		return WeakPasswordError("password is too common or has appeared in a known breach; choose a different one")
+	}
 	return nil
 }
 
