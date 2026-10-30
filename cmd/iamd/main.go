@@ -76,6 +76,16 @@ func run() error {
 		}
 	}
 
+	// Extend the breached/common-password denylist from an operator file if one
+	// is configured (security follow-up #1). Fail fast: a configured-but-
+	// unreadable list is a misconfiguration, not something to silently ignore.
+	if cfg.WeakPasswordFile != "" {
+		if err := authn.AddWeakPasswordFile(cfg.WeakPasswordFile); err != nil {
+			return err
+		}
+		slog.Info("loaded operator weak-password denylist", "file", cfg.WeakPasswordFile)
+	}
+
 	// Size the process-wide password-hashing pool and check it against the
 	// container's memory limit before serving. Each slot can hold ~64 MiB
 	// resident while hashing, so an oversized pool risks OOM (internal security
