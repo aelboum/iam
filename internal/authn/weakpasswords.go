@@ -40,6 +40,8 @@ func parseWeakPasswords(r io.Reader) map[string]struct{} {
 // larger offline corpus such as the Have I Been Pwned "Pwned Passwords"
 // top-N export can be dropped in without rebuilding the binary.
 func AddWeakPasswordFile(path string) error {
+	// #nosec G304 -- path comes from the operator-set IAM_WEAK_PASSWORD_FILE
+	// environment variable (trusted deploy configuration), not from user input.
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open weak-password file: %w", err)
