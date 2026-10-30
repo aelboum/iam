@@ -143,8 +143,12 @@ func (s *Storage) AuthRequestByID(ctx context.Context, id string) (op.AuthReques
 // client secret after this call, so claiming the code here would let anyone
 // who saw a code burn it with a wrong verifier. The code is claimed in
 // claimCode, once tokens are about to be issued.
+//
+// The code is stored as its SHA-256 (see SaveAuthCode), so look it up by the
+// same hash: a read of the auth_requests table never yields a usable code
+// (audit N17).
 func (s *Storage) AuthRequestByCode(ctx context.Context, code string) (op.AuthRequest, error) {
-	r, err := s.store.GetAuthRequestByCode(ctx, code)
+	r, err := s.store.GetAuthRequestByCode(ctx, secret.Hash(code))
 	if err != nil {
 		return nil, fmt.Errorf("auth code: %w", err)
 	}
@@ -163,8 +167,12 @@ func (s *Storage) claimCode(ctx context.Context, ar *authRequest) error {
 	return nil
 }
 
+// SaveAuthCode stores only the SHA-256 of the authorization code, never the
+// code itself, so a read of the auth_requests table (a leaked backup or a SQL
+// read) cannot be replayed to redeem a token. The code is high-entropy, so a
+// plain hash is sufficient and matches how refresh tokens are stored (audit N17).
 func (s *Storage) SaveAuthCode(ctx context.Context, id, code string) error {
-	return s.store.SetAuthCode(ctx, id, code, authCodeLifetime)
+	return s.store.SetAuthCode(ctx, id, secret.Hash(code), authCodeLifetime)
 }
 
 func (s *Storage) DeleteAuthRequest(ctx context.Context, id string) error {

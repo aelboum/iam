@@ -271,3 +271,18 @@ strips the unsupported `response_types_supported` / `grant_types_supported` entr
 discovery document (regression test `TestHonestDiscovery`). This audit and these remediations do
 **not** satisfy criterion 12 and are **not** an independent external penetration test; production
 readiness remains NO-GO pending that and the remaining P1/P2 work.
+
+**Wave 3 — P3-7 (part 1) hash authorization codes at rest (2026-10-30).** Per the
+remediation roadmap (SECURITY_REMEDIATION_ROADMAP.md P3-7, finding N17): the OIDC
+authorization code is now stored as its SHA-256, never in the clear. `SaveAuthCode`
+hashes the code before writing it and `AuthRequestByCode` hashes before the lookup
+(`internal/oidcop/storage.go`), so the `auth_requests.code` column holds only the hash
+and a leaked backup or a SQL read cannot be replayed to redeem a token — the same
+treatment refresh tokens already get. Codes are high-entropy, so a plain hash suffices.
+Regression test `TestAuthCodeStoredHashedAtRest` (the column holds the hash, the raw
+code round-trips, the stored hash is not itself usable as a code). The HKDF half of P3-7
+(CRYPTO-06, use HKDF in `secret.Derive`) is **not** included here: it changes the key
+derivation for the master key and would need a backward-compatibility path so existing
+sealed data still opens, so it is sequenced as its own change. This is a hardening change
+only; it does not satisfy criterion 12 and does not change the overall status — production
+readiness remains NO-GO.
