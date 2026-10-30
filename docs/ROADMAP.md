@@ -286,3 +286,21 @@ IPv4 is unchanged. Regression tests (`TestOAuthLimiterCoversAllProviderEndpoints
 the operator docs (OPERATIONS.md) are updated. This is a hardening change only; it
 does not satisfy criterion 12 and does not change the overall status — production
 readiness remains NO-GO.
+
+**Wave 3 — P2-6 supply chain: SBOM + Action digest pinning (2026-10-30).** Per the
+remediation roadmap (SECURITY_REMEDIATION_ROADMAP.md P2-6, findings SUPPLY-05/06/07):
+the CI pipeline now emits a **CycloneDX SBOM** of the runtime image (its OS packages
+and the Go module list baked into the binary) as a build artifact (`sbom.cdx.json`),
+and **every third-party GitHub Action is pinned to an immutable commit SHA** with its
+version in a trailing comment (`actions/checkout`, `actions/setup-go`,
+`actions/setup-python`, `actions/upload-artifact`). A `.github/dependabot.yml`
+(github-actions, weekly) keeps those pins current so pinning does not freeze out
+upstream security fixes. **Deliberately deferred** (recorded, not silently dropped):
+*image* base-layer digest pinning stays off because the deployment intentionally uses
+floating minor base tags so a rebuild picks up upstream fixes without a bump bot
+(consistent with the earlier image-scan decision); and **release signing + SLSA
+provenance (`cosign`)** is deferred because the repo has no artifact-publish/release
+pipeline yet — there is nothing published to sign, and a keyless-signing/registry setup
+is an owner/deploy decision, not an autonomous CI change. This is a supply-chain
+hardening change only; it does not satisfy criterion 12 and does not change the overall
+status — production readiness remains NO-GO.

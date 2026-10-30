@@ -1,0 +1,14 @@
+# Keep the SHA-pinned GitHub Actions current. Pinning each action to an
+# immutable commit SHA (SUPPLY-06, see .github/workflows/ci.yml) closes the
+# floating-tag supply-chain risk, but it also freezes the action at that commit,
+# so it would otherwise miss upstream security fixes. Dependabot opens a weekly
+# PR to bump a pinned action (updating both the SHA and its version comment)
+# whenever a new release ships, keeping the pins both immutable and current.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(ci)"
