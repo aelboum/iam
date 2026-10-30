@@ -398,6 +398,12 @@ func (s *Server) removeTOTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, err)
 		return
 	}
+	// Removing a factor may be a response to its compromise, so also revoke
+	// already-issued tokens, matching setPassword/lockUser/deleteUser (audit L-03).
+	if err := s.store.RevokeUserTokens(r.Context(), user.ID); err != nil {
+		fail(w, r, err)
+		return
+	}
 	s.audit(r, user.OrgID, "user.totp_removed", "user:"+user.ID, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -668,6 +674,12 @@ func (s *Server) deletePasskey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteUserSessions(r.Context(), user.ID); err != nil {
+		fail(w, r, err)
+		return
+	}
+	// Removing a passkey may be a response to its compromise, so also revoke
+	// already-issued tokens, matching setPassword/lockUser/deleteUser (audit L-03).
+	if err := s.store.RevokeUserTokens(r.Context(), user.ID); err != nil {
 		fail(w, r, err)
 		return
 	}

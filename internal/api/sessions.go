@@ -27,6 +27,18 @@ func loginClient(r *http.Request) authn.Client {
 	return c
 }
 
+// sessionToken returns the session token for a POST session route, preferring
+// the X-Session-Token header over the JSON body field so every session route
+// accepts the header consistently with GET/DELETE (audit L-05). The body field
+// stays supported for compatibility; the header is preferred so the token need
+// not travel in a request body that an integrator might log.
+func sessionToken(r *http.Request, bodyToken string) string {
+	if h := r.Header.Get(sessionTokenHeader); h != "" {
+		return h
+	}
+	return bodyToken
+}
+
 func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Org       string `json:"org"` // org id or slug
@@ -88,7 +100,7 @@ func (s *Server) checkPassword(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	state, err := s.authn.CheckPassword(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken, body.Password)
+	state, err := s.authn.CheckPassword(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), sessionToken(r, body.SessionToken), body.Password)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -104,7 +116,7 @@ func (s *Server) checkTOTP(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	state, err := s.authn.CheckTOTP(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken, body.Code)
+	state, err := s.authn.CheckTOTP(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), sessionToken(r, body.SessionToken), body.Code)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -120,7 +132,7 @@ func (s *Server) checkRecoveryCode(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	state, err := s.authn.CheckRecoveryCode(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken, body.Code)
+	state, err := s.authn.CheckRecoveryCode(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), sessionToken(r, body.SessionToken), body.Code)
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -146,7 +158,7 @@ func (s *Server) finalizeAuthRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := chi.URLParam(r, "authRequestID")
-	if err := s.authn.FinalizeAuthRequest(r.Context(), loginClient(r), id, body.SessionID, body.SessionToken); err != nil {
+	if err := s.authn.FinalizeAuthRequest(r.Context(), loginClient(r), id, body.SessionID, sessionToken(r, body.SessionToken)); err != nil {
 		fail(w, r, err)
 		return
 	}
@@ -281,7 +293,7 @@ func (s *Server) beginPasskeyLogin(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	options, err := s.authn.BeginPasskeyLogin(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken)
+	options, err := s.authn.BeginPasskeyLogin(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), sessionToken(r, body.SessionToken))
 	if err != nil {
 		fail(w, r, err)
 		return
@@ -297,7 +309,7 @@ func (s *Server) finishPasskeyLogin(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &body) {
 		return
 	}
-	state, err := s.authn.FinishPasskeyLogin(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken, body.Credential)
+	state, err := s.authn.FinishPasskeyLogin(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), sessionToken(r, body.SessionToken), body.Credential)
 	if err != nil {
 		fail(w, r, err)
 		return
