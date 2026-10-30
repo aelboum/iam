@@ -143,8 +143,11 @@ func (s *Storage) AuthRequestByID(ctx context.Context, id string) (op.AuthReques
 // client secret after this call, so claiming the code here would let anyone
 // who saw a code burn it with a wrong verifier. The code is claimed in
 // claimCode, once tokens are about to be issued.
+//
+// The code is stored as its SHA-256 (see SaveAuthCode), so look it up by the
+// same hash (audit N17).
 func (s *Storage) AuthRequestByCode(ctx context.Context, code string) (op.AuthRequest, error) {
-	r, err := s.store.GetAuthRequestByCode(ctx, code)
+	r, err := s.store.GetAuthRequestByCode(ctx, secret.Hash(code))
 	if err != nil {
 		return nil, fmt.Errorf("auth code: %w", err)
 	}
@@ -163,8 +166,15 @@ func (s *Storage) claimCode(ctx context.Context, ar *authRequest) error {
 	return nil
 }
 
+// SaveAuthCode stores only the SHA-256 of the authorization code. The code the
+// library hands us is already an op-crypto (AES-GCM) ciphertext, so the column
+// was never plaintext; hashing it additionally means a reader of auth_requests
+// who ALSO holds the master key (and could therefore decrypt the op-crypto
+// layer) still cannot recover a redeemable code from the table. The value is
+// high-entropy, so a plain hash is sufficient and matches how refresh tokens
+// are stored (audit N17).
 func (s *Storage) SaveAuthCode(ctx context.Context, id, code string) error {
-	return s.store.SetAuthCode(ctx, id, code, authCodeLifetime)
+	return s.store.SetAuthCode(ctx, id, secret.Hash(code), authCodeLifetime)
 }
 
 func (s *Storage) DeleteAuthRequest(ctx context.Context, id string) error {
