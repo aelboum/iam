@@ -402,6 +402,27 @@ func (s *Server) removeTOTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// generateRecoveryCodes issues a fresh set of single-use MFA backup codes,
+// replacing any existing set, and returns them once (security follow-up #3).
+func (s *Server) generateRecoveryCodes(w http.ResponseWriter, r *http.Request) {
+	user, err := s.userForCaller(r, chi.URLParam(r, "userID"))
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	if err := humanOnly(user); err != nil {
+		fail(w, r, err)
+		return
+	}
+	codes, err := s.authn.GenerateRecoveryCodes(r.Context(), user)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	s.audit(r, user.OrgID, "user.recovery_codes_generated", "user:"+user.ID, map[string]any{"count": len(codes)})
+	writeJSON(w, http.StatusCreated, map[string]any{"recovery_codes": codes})
+}
+
 // --- user grants --------------------------------------------------------------------------
 
 func (s *Server) listUserGrants(w http.ResponseWriter, r *http.Request) {
