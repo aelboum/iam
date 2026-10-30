@@ -113,7 +113,7 @@ This delta narrows only **operational-hardening** gaps, mostly relative to **Key
 - **RFC 9700 / OIDC Core:** + honest discovery metadata, + honest RP-initiated logout, + authorization-code hashed at rest (defense-in-depth), with PKCE-S256 already enforced for all interactive clients. Open: N14 (code-reuse token revocation SHOULD).
 - **OWASP ASVS 5.0:** + V7 (session termination on sensitive change), + V11 (anti-automation coverage complete). Unchanged weak areas: V1/V10 (central policy, logging/monitoring).
 - **NIST SP 800-63B-4:** throttling now complete across entry points; verifier/secret handling unchanged (already strong).
-- **SLSA:** build now emits an SBOM and pins its CI actions → approaches **L1** hygiene; **L2+ (signed provenance)** still missing.
+- **SLSA:** the build emits an SBOM and pins its CI actions (supply-chain hygiene), but this meets **no SLSA level** — SLSA requires a build **provenance attestation**, which the pipeline does not generate. Provenance/signing is **MISSING** (see `FINAL_ASSESSMENT_VERIFICATION_2026-10-30_54ca2a0.md` §SLSA).
 - **CIS / NIST 800-53:** PG-container hardening (CM/AC) added; SI (monitoring/alerting) and SC (KMS/key isolation) controls unchanged and still the main gaps.
 
 ---
