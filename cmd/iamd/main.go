@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -189,7 +191,7 @@ func run() error {
 	if cfg.TrustProxy {
 		router.Use(forwardedFor(cfg.ProxyHops))
 	}
-	router.Use(middleware.Recoverer, securityHeaders, noStore, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
+	router.Use(middleware.Recoverer, securityHeaders, relaxCSPForFormPost, noStore, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
@@ -400,6 +402,100 @@ func securityHeaders(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// formPostPaths are the OIDC authorization endpoints that can render the
+// auto-submitting form_post HTML page (zitadel/oidc AuthResponseFormPost). That
+// page carries an inline onload auto-submit and a cross-origin <form action>
+// pointing at the relying party's already-validated redirect_uri, both of which
+// the strict API CSP (default-src 'none'; form-action 'self') blocks — finding
+// M-01. Only responses on these paths are eligible for the scoped relaxation.
+var formPostPaths = map[string]bool{
+	"/authorize": true, "/authorize/callback": true,
+}
+
+// formPostActionRe extracts the single <form action="..."> target from the
+// fixed form_post template. The template has exactly one form, so this is
+// deterministic; the captured value is the redirect_uri the library already
+// validated against the client's registered allow-list before rendering.
+var formPostActionRe = regexp.MustCompile(`action="([^"]+)"`)
+
+// formPostMarker is a string unique to the form_post template's auto-submit
+// handler; its presence identifies a form_post response and distinguishes it
+// from the redirects, JSON errors and other non-HTML responses on the same
+// paths, which keep the strict CSP.
+var formPostMarker = []byte("document.forms[0].submit()")
+
+// relaxCSPForFormPost narrows the CSP relaxation needed for the OIDC form_post
+// auto-submit page (finding M-01) to that page alone. On the authorization
+// paths it buffers the response; if the body is the form_post page it replaces
+// the strict policy set by securityHeaders with one that
+//   - permits the page's fixed inline auto-submit (script-src 'unsafe-inline'),
+//   - permits the single cross-origin POST only to the exact origin of the
+//     already-validated redirect_uri (form-action <origin>),
+//   - keeps default-src 'none', base-uri 'none' and frame-ancestors 'none'.
+//
+// A nonce/hash would need a fork of the library template (it has no nonce hook)
+// or 'unsafe-hashes', which is less interoperable; the page carries no
+// user-controlled script, only HTML-escaped data in hidden inputs, so a
+// page-scoped 'unsafe-inline' is a bounded, justified relaxation. Every other
+// response — JSON, redirects (including query-mode), errors — keeps the strict
+// policy. If the redirect origin cannot be parsed the strict policy is kept
+// (fail closed), so a malformed response never gets a looser policy.
+func relaxCSPForFormPost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !formPostPaths[strings.TrimSuffix(r.URL.Path, "/")] {
+			next.ServeHTTP(w, r)
+			return
+		}
+		dw := &deferredWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(dw, r)
+		if csp, ok := formPostCSP(dw.buf.Bytes()); ok {
+			w.Header().Set("Content-Security-Policy", csp)
+		}
+		w.WriteHeader(dw.status)
+		_, _ = w.Write(dw.buf.Bytes())
+	})
+}
+
+// deferredWriter buffers the body and status so relaxCSPForFormPost can inspect
+// the body (to decide and build the scoped CSP) before the real headers are
+// committed. Header writes pass straight through to the wrapped writer, so
+// headers the handler sets (Cache-Control, etc.) are preserved.
+type deferredWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	buf         bytes.Buffer
+}
+
+func (d *deferredWriter) WriteHeader(code int) {
+	if !d.wroteHeader {
+		d.status = code
+		d.wroteHeader = true
+	}
+}
+
+func (d *deferredWriter) Write(b []byte) (int, error) { return d.buf.Write(b) }
+
+// formPostCSP returns the scoped CSP for a form_post auto-submit page, or
+// ok=false when body is not that page or the redirect origin cannot be parsed
+// (caller then keeps the strict CSP — fail closed).
+func formPostCSP(body []byte) (string, bool) {
+	if !bytes.Contains(body, formPostMarker) {
+		return "", false
+	}
+	m := formPostActionRe.FindSubmatch(body)
+	if m == nil {
+		return "", false
+	}
+	u, err := url.Parse(string(m[1]))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	origin := u.Scheme + "://" + u.Host
+	return "default-src 'none'; script-src 'unsafe-inline'; form-action " + origin +
+		"; base-uri 'none'; frame-ancestors 'none'", true
 }
 
 // noStorePaths are responses that carry tokens or token-derived identity.
