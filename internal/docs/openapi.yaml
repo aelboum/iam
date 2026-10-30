@@ -136,6 +136,29 @@ paths:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/Error" }
 
+  /v1/orgs/{orgID}/mfa-policy:
+    parameters: [{ $ref: "#/components/parameters/orgID" }]
+    put:
+      tags: [Orgs]
+      summary: Set the org's MFA enforcement policy
+      description: >-
+        When mfa_required is true, every user of this org must have and use a
+        second factor (TOTP or a passkey). A user with no factor can verify a
+        first factor but the session reports mfa_enrollment_required and cannot
+        finalize until they enrol one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mfa_required]
+              properties:
+                mfa_required: { type: boolean }
+      responses:
+        "200": { $ref: "#/components/responses/Org" }
+        "404": { $ref: "#/components/responses/Error" }
+
   /v1/orgs/{orgID}/api-keys:
     parameters: [{ $ref: "#/components/parameters/orgID" }]
     post:
