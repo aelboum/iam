@@ -324,6 +324,28 @@ func (s *Storage) TerminateSession(ctx context.Context, userID, clientID string)
 	return s.store.TerminateTokens(ctx, userID, clientID)
 }
 
+// TerminateSessionFromRequest handles an RP-initiated logout (`end_session`).
+// The library calls this in place of TerminateSession because Storage satisfies
+// op.CanTerminateSessionFromRequest.
+//
+// A verified id_token_hint is required to revoke anything. Without one the
+// request carries no user identity (req.UserID is empty, since the library only
+// populates it from a validated id_token_hint), so there is nothing to revoke
+// by — and revoking by client_id alone would let any unauthenticated caller end
+// every user's session for that client, a logout CSRF / denial of service.
+// Returning an invalid_request error here makes the endpoint reject hint-less
+// logout with a clear 400 instead of redirecting to a false "signed out" while
+// the access and refresh tokens keep working (audit L-01).
+func (s *Storage) TerminateSessionFromRequest(ctx context.Context, req *op.EndSessionRequest) (string, error) {
+	if req.UserID == "" {
+		return "", oidc.ErrInvalidRequest().WithDescription("id_token_hint is required to end the session")
+	}
+	if err := s.store.TerminateTokens(ctx, req.UserID, req.ClientID); err != nil {
+		return "", err
+	}
+	return req.RedirectURI, nil
+}
+
 // RevokeToken is called by the library in three shapes:
 //   - a refresh token resolved by GetRefreshTokenInfo: tokenOrTokenID is the
 //     refresh token's row id and userID is set;
