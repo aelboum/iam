@@ -205,7 +205,7 @@ Authoritative status as of commit `323075c` (CI `test`/`e2e`/`security`/`image-s
 | # | Criterion | Status | Evidence |
 |---|-----------|--------|----------|
 | 1 | No unresolved Critical/High security findings | **PASS** | SECURITY.md; three independent reviews, none open above Low |
-| 2 | Every Medium fixed or dispositioned | **PASS (1 item pending)** | D3 accepted-by-design (SECURITY.md register). The 2026-10-29 internal audit (docs/security/INTERNAL_SECURITY_AUDIT.md) found two further Medium items: container `mem_limit` is now fixed in the prod/staging compose files; the CSP/`form_post` item remains **open** on `323075c` and awaits owner disposition — see the reconciliation note below. |
+| 2 | Every Medium fixed or dispositioned | **PASS** | D3 accepted-by-design (SECURITY.md register). The 2026-10-29 internal audit (docs/security/INTERNAL_SECURITY_AUDIT.md) found two further Medium items, both now fixed: container `mem_limit` in the prod/staging compose files, and the CSP/`form_post` break (M-01) fixed in PR #21 (merged to `main`, commit `48649bf`) with regression tests — see the reconciliation note below. |
 | 3 | Required CI jobs pass on the final commit | **PASS** | `323075c`: `test`, `e2e`, `security`, `image-scan` success |
 | 4 | Migration/upgrade paths tested | **PASS** | WS4; `migration_rehearsal.sh` ALL_PASS (local + staging) |
 | 5 | Backup/restore + recovery with reproducible evidence | **PASS** | EXTERNAL_VALIDATION §4; 4.90s (empty) and 8.73s (71 MB synthetic) |
@@ -226,9 +226,8 @@ cannot be satisfied internally — **criterion 12, an independent external penet
 has been **waived by the owner** (2026-10-28), who formally accepted the risk of releasing
 without it (SECURITY.md, register W1 and the "Waived gate" subsection); it is recorded as
 **NOT PERFORMED — WAIVED**, not passed, and internal/AI-assisted testing is still not
-represented as equivalent. With that gate waived, one *technical* item remains open — the
-CSP/`form_post` Medium from the 2026-10-29 internal audit (see the reconciliation note below),
-pending owner disposition — and
+represented as equivalent. With that gate waived, no *technical* gate remains blocking (the
+CSP/`form_post` Medium from the 2026-10-29 internal audit was fixed in PR #21), but
 production stays **NO-GO** until the owner **explicitly authorizes release** and the production
 hardening follow-ups (stable DNS instead of the ephemeral tunnel, a managed secret store, DB
 TLS, bootstrap-admin rotation — step-by-step runbook with verification and rollback:
@@ -255,12 +254,11 @@ docs/security/INTERNAL_SECURITY_AUDIT.md) reviewed commit `2f78ab6` and found **
 and no High**, two Medium, six Low, and eight Informational. Of the two Medium items: the
 missing container `mem_limit` (which left the N12 sizing guard disengaged) is **fixed** —
 `docker-compose.prod.yml` and `docker-compose.staging.yml` now set `mem_limit: 1g`; the
-global CSP (`default-src 'none'; … form-action 'self'`) that breaks `response_mode=form_post`
-for relying parties is **still open** on `323075c` (verified: `securityHeaders` is global
-middleware in `cmd/iamd/main.go` and the OIDC provider is mounted at `/`, so the policy
-covers authorize responses). This item is tracked against criterion 2 and awaits an owner
-decision — fix (scope the CSP off the provider mount, or allow the nonce'd auto-submit) or
-disposition (declare `form_post` unsupported). The six Low items (logout/factor-removal token
+global CSP (`default-src 'none'; … form-action 'self'`) that broke `response_mode=form_post`
+for relying parties (M-01) is now **fixed** — PR #21 (merged to `main`, commit `48649bf`) adds a
+page-scoped `relaxCSPForFormPost` middleware that permits the auto-submit and the single
+cross-origin POST to the validated redirect origin on the form_post page only, keeping the
+strict policy everywhere else, with regression test `TestFormPostCSP`. The six Low items (logout/factor-removal token
 semantics, discovery drift, session-token transport, Postgres service hardening) remain to be
 dispositioned. This audit does **not** satisfy criterion 12 and is **not** an independent
 external penetration test.
