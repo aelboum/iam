@@ -272,6 +272,21 @@ discovery document (regression test `TestHonestDiscovery`). This audit and these
 **not** satisfy criterion 12 and are **not** an independent external penetration test; production
 readiness remains NO-GO pending that and the remaining P1/P2 work.
 
+**Wave 3 — P3-8 rate-limit coverage (2026-10-30).** Per the remediation roadmap
+(SECURITY_REMEDIATION_ROADMAP.md P3-8, findings I-05/N10), the per-IP rate
+limiter in `cmd/iamd/main.go` now covers every public provider endpoint that was
+previously unthrottled: `/userinfo`, `/end_session` and `/device_authorization`
+share the OAuth budget (120/60), and the cacheable metadata endpoints `/keys`
+(JWKS) and `/.well-known/openid-configuration` (discovery) get a wider budget
+(240/120) so legitimate relying-party polling is not broken. IPv6 sources are now
+keyed by their `/64` prefix instead of the full address, so an attacker cannot
+defeat the limit by rotating through the addresses of a single assignment (N10);
+IPv4 is unchanged. Regression tests (`TestOAuthLimiterCoversAllProviderEndpoints`,
+`TestLimiterKeyCollapsesIPv6To64`, `TestOAuthLimiterSharesIPv6Slash64Bucket`) and
+the operator docs (OPERATIONS.md) are updated. This is a hardening change only; it
+does not satisfy criterion 12 and does not change the overall status — production
+readiness remains NO-GO.
+
 **Wave 3 — P2-6 supply chain: SBOM + Action digest pinning (2026-10-30).** Per the
 remediation roadmap (SECURITY_REMEDIATION_ROADMAP.md P2-6, findings SUPPLY-05/06/07):
 the CI pipeline now emits a **CycloneDX SBOM** of the runtime image (its OS packages
