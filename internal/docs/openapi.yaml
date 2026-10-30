@@ -378,6 +378,25 @@ paths:
       responses:
         "204": { description: Revoked }
 
+  /v1/users/{userID}/recovery-codes:
+    parameters: [{ $ref: "#/components/parameters/userID" }]
+    post:
+      tags: [MFA]
+      summary: Generate MFA backup/recovery codes (returned once)
+      description: >-
+        Replaces any existing set with a fresh batch of single-use codes that
+        can be used in place of the second factor. The plaintext codes are
+        returned only here; the engine stores only their hashes.
+      responses:
+        "201":
+          description: Recovery codes, shown once
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recovery_codes: { type: array, items: { type: string } }
+
   /v1/users/{userID}/totp:
     parameters: [{ $ref: "#/components/parameters/userID" }]
     post:
@@ -999,6 +1018,29 @@ paths:
               properties:
                 session_token: { type: string }
                 code: { type: string, example: "123456" }
+      responses:
+        "200": { $ref: "#/components/responses/Session" }
+        "401": { $ref: "#/components/responses/Error" }
+
+  /v1/sessions/{sessionID}/recovery-code:
+    parameters: [{ $ref: "#/components/parameters/sessionID" }]
+    post:
+      tags: [Sessions]
+      summary: Use a backup/recovery code as the second factor
+      description: >-
+        An alternative to the TOTP step when the user has lost their authenticator.
+        Requires the first factor first. Each code is single-use.
+      parameters: [{ $ref: "#/components/parameters/endUserIP" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_token, code]
+              properties:
+                session_token: { type: string }
+                code: { type: string }
       responses:
         "200": { $ref: "#/components/responses/Session" }
         "401": { $ref: "#/components/responses/Error" }

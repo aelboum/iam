@@ -393,6 +393,7 @@ type SessionState struct {
 	Token           string `json:"session_token,omitempty"`
 	PasswordChecked bool   `json:"password_checked"`
 	TOTPChecked     bool   `json:"totp_checked"`
+	RecoveryChecked bool   `json:"recovery_checked"`
 	PasskeyChecked  bool   `json:"passkey_checked"`
 	IDPChecked      bool   `json:"idp_checked"`
 	MFARequired     bool   `json:"mfa_required"`
@@ -603,6 +604,69 @@ func (s *Service) CheckTOTP(ctx context.Context, c Client, id, token, code strin
 	return s.GetSession(ctx, c, id, token)
 }
 
+// recoveryCodeCount is how many single-use backup codes are issued per set.
+const recoveryCodeCount = 10
+
+// GenerateRecoveryCodes issues a fresh set of single-use backup codes for the
+// user, replacing any existing set, and returns the plaintext codes once. Only
+// their HMAC hashes are stored (security follow-up #3).
+func (s *Service) GenerateRecoveryCodes(ctx context.Context, user *store.User) ([]string, error) {
+	codes := make([]string, recoveryCodeCount)
+	hashes := make([]string, recoveryCodeCount)
+	for i := range codes {
+		code := secret.Token(8)
+		codes[i] = code
+		hashes[i] = s.codeHash(user.ID, code)
+	}
+	if err := s.store.ReplaceRecoveryCodes(ctx, user.ID, hashes); err != nil {
+		return nil, err
+	}
+	return codes, nil
+}
+
+// CheckRecoveryCode consumes a single-use recovery code as the session's second
+// factor, mirroring CheckTOTP's lockout and rate-limit handling. A used or
+// unknown code counts as a failed MFA attempt (shared TOTP lockout counter).
+func (s *Service) CheckRecoveryCode(ctx context.Context, c Client, id, token, code string) (*SessionState, error) {
+	sess, user, err := s.loadSession(ctx, c, id, token)
+	if err != nil {
+		return nil, err
+	}
+	if (sess.PasswordCheckedAt == nil && sess.IDPCheckedAt == nil) || user == nil {
+		return nil, ErrNotAuthenticated // a first factor first, so it cannot be probed alone
+	}
+	if !s.accountLimit.Allow(attemptKey(sess)) {
+		return nil, ErrRateLimited
+	}
+	if user.IsMFALocked() {
+		return nil, ErrLocked
+	}
+	reserved, err := s.store.ReserveAttempt(ctx, user.ID, store.FactorTOTP, s.cfg.MaxFailedLogins)
+	if err != nil {
+		return nil, err
+	}
+	if !reserved {
+		return nil, ErrLocked // the caller already proved the first factor
+	}
+	consumed, err := s.store.ConsumeRecoveryCode(ctx, user.ID, s.codeHash(user.ID, code))
+	if err != nil {
+		// The code was never evaluated (transient store error): release the
+		// reserved attempt rather than advance the MFA lockout counter.
+		s.releaseAttempt(ctx, user.ID, store.FactorTOTP)
+		return nil, err
+	}
+	if !consumed {
+		return nil, s.attemptFailed(ctx, c, user, store.FactorTOTP)
+	}
+	if err := s.store.AttemptSucceeded(ctx, user.ID, store.FactorTOTP); err != nil {
+		return nil, err
+	}
+	if err := s.store.MarkSessionRecovery(ctx, sess.ID); err != nil {
+		return nil, err
+	}
+	return s.GetSession(ctx, c, id, token)
+}
+
 // attemptFailed settles a failed reserved attempt and returns the error to report.
 func (s *Service) attemptFailed(ctx context.Context, c Client, user *store.User, f store.Factor) error {
 	locked, err := s.store.AttemptFailed(ctx, user.ID, f, s.cfg.MaxFailedLogins, s.cfg.LockoutDuration)
@@ -770,6 +834,7 @@ func (s *Service) state(sess *store.Session, user *store.User, orgMFARequired, h
 		ID:              sess.ID,
 		PasswordChecked: known && sess.PasswordCheckedAt != nil,
 		TOTPChecked:     sess.TOTPCheckedAt != nil,
+		RecoveryChecked: sess.RecoveryCheckedAt != nil,
 		PasskeyChecked:  known && sess.PasskeyCheckedAt != nil,
 		IDPChecked:      known && sess.IDPCheckedAt != nil,
 		ExpiresAt:       sess.ExpiresAt,
@@ -797,8 +862,9 @@ func (s *Service) state(sess *store.Session, user *store.User, orgMFARequired, h
 	case st.IDPChecked && sess.IDPTrustMFA:
 		// An instance admin trusts this IdP to enforce MFA (audit D1).
 		at, st.AMR = sess.IDPCheckedAt, []string{"fed", "mfa"}
-	case st.IDPChecked && (!st.MFARequired || st.TOTPChecked):
-		// Otherwise users who enrolled TOTP must still enter it after SSO.
+	case st.IDPChecked && (!st.MFARequired || st.TOTPChecked || st.RecoveryChecked):
+		// Otherwise users who enrolled MFA must still present a second factor
+		// (TOTP or a recovery code) after SSO.
 		at, st.AMR = sess.IDPCheckedAt, []string{"fed"}
 		if st.TOTPChecked {
 			st.AMR = append(st.AMR, "otp", "mfa")
@@ -806,12 +872,24 @@ func (s *Service) state(sess *store.Session, user *store.User, orgMFARequired, h
 				at = sess.TOTPCheckedAt
 			}
 		}
-	case st.PasswordChecked && (!st.MFARequired || st.TOTPChecked):
+		if st.RecoveryChecked {
+			st.AMR = append(st.AMR, "rc", "mfa")
+			if sess.RecoveryCheckedAt.After(*at) {
+				at = sess.RecoveryCheckedAt
+			}
+		}
+	case st.PasswordChecked && (!st.MFARequired || st.TOTPChecked || st.RecoveryChecked):
 		at, st.AMR = sess.PasswordCheckedAt, []string{"pwd"}
 		if st.TOTPChecked {
 			st.AMR = append(st.AMR, "otp", "mfa")
 			if sess.TOTPCheckedAt.After(*at) {
 				at = sess.TOTPCheckedAt
+			}
+		}
+		if st.RecoveryChecked {
+			st.AMR = append(st.AMR, "rc", "mfa")
+			if sess.RecoveryCheckedAt.After(*at) {
+				at = sess.RecoveryCheckedAt
 			}
 		}
 	}

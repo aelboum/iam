@@ -112,6 +112,22 @@ func (s *Server) checkTOTP(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, state)
 }
 
+func (s *Server) checkRecoveryCode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionToken string `json:"session_token"`
+		Code         string `json:"code"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	state, err := s.authn.CheckRecoveryCode(r.Context(), loginClient(r), chi.URLParam(r, "sessionID"), body.SessionToken, body.Code)
+	if err != nil {
+		fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
 func (s *Server) getAuthRequest(w http.ResponseWriter, r *http.Request) {
 	info, err := s.authn.GetAuthRequest(r.Context(), loginClient(r), chi.URLParam(r, "authRequestID"))
 	if err != nil {

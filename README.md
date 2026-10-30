@@ -139,6 +139,11 @@ no second factor can still verify a first factor, but the session reports
 (`POST /v1/users/{id}/totp` + verify, or a passkey) and complete the second-factor
 step first.
 
+**Backup / recovery codes.** Generate a set of single-use codes for a user with
+`POST /v1/users/{id}/recovery-codes` (returned once; regenerating replaces the set).
+If the user loses their authenticator, use one in place of the TOTP step with
+`POST /v1/sessions/{sid}/recovery-code` `{"session_token","code"}`.
+
 Other ways to authenticate the session in step 3:
 
 - **Passkey (passwordless):** `POST /v1/sessions/{sid}/passkey/begin` gives options for
