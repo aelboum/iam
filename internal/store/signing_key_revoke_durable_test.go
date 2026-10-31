@@ -206,3 +206,25 @@ func TestRevokeSigningKeyUnknownIsAtomicNotFound(t *testing.T) {
 		t.Errorf("unknown-id revocation wrote %d audit events, want 0", n)
 	}
 }
+
+// Test 17: PurgeExpired must never remove revocation evidence. The tombstone
+// table has no expires_at and is not in PurgedTables, so resurrection protection
+// is durable: a tombstone survives routine purging indefinitely.
+func TestPurgeExpiredRetainsTombstone(t *testing.T) {
+	st, pool, ctx := openRevokeTestStore(t)
+	defer pool.Close()
+	id := uuid.NewString()
+	defer pool.Exec(ctx, `DELETE FROM revoked_signing_keys WHERE id=$1`, id)
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO revoked_signing_keys (id, revoked_by, reason) VALUES ($1,'system','retention-test')`, id,
+	); err != nil {
+		t.Fatalf("insert tombstone: %v", err)
+	}
+	if err := st.PurgeExpired(ctx); err != nil {
+		t.Fatalf("purge expired: %v", err)
+	}
+	if !tombstoned(t, pool, ctx, id) {
+		t.Error("PurgeExpired removed a revocation tombstone")
+	}
+}
