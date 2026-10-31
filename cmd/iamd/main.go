@@ -400,13 +400,20 @@ func purgeOnce() error {
 	return st.PurgeRateLimits(ctx)
 }
 
-// revokeSigningKey is the emergency response to a leaked signing key (audit
-// CRYPTO-05). It drops the key from the database so that, within one key-cache
-// interval, every running instance stops publishing it in the JWKS and signing
-// with it, and relying parties reject the tokens it signed — bounding a leaked
-// key to minutes instead of its full lifetime. If this removed the last usable
-// key, a running engine promotes a published successor or generates a new key
-// on its next key reload, so signing continues.
+// revokeSigningKey is the emergency response to a leaked signing key (CRYPTO-05).
+// It durably revokes the key: the key is marked REVOKED, a permanent tombstone is
+// written and a single audit event is recorded, all in one transaction, so the
+// revocation survives restart and cannot be resurrected by a reappearing row.
+// Within one key-cache interval every running engine stops publishing the key in
+// the JWKS and signing with it, provided the database is reachable at its next
+// reload; an engine that cannot reach the database stops signing rather than keep
+// using a cached key. If this was the active signer, a running engine promotes a
+// published successor or generates a new key on its next reload, so signing
+// continues. The reason is read from IAM_REVOKE_REASON when set.
+//
+// Already-issued JWT access tokens remain valid at external resource servers
+// until their JWKS cache refreshes and the token exp passes; IAM cannot recall
+// them. Revocation is irreversible for this key.
 func revokeSigningKey(id string) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -422,10 +429,16 @@ func revokeSigningKey(id string) error {
 		return err
 	}
 	st := store.New(pool)
-	if err := st.DeleteSigningKey(ctx, id); err != nil {
+	reason := os.Getenv("IAM_REVOKE_REASON")
+	if reason == "" {
+		reason = "emergency revocation via iamd revoke-key"
+	}
+	// Returns only after a durable commit; on an ambiguous failure the operator
+	// re-runs this command, which is idempotent.
+	if err := st.RevokeSigningKey(ctx, id, "system", reason); err != nil {
 		return err
 	}
-	slog.Warn("signing key revoked: it leaves the JWKS and stops being accepted within ~1 minute across all instances, and tokens it signed are then rejected. If it was the active signer, a running engine promotes a successor or generates a new key on its next reload.", "key_id", id)
+	slog.Warn("signing key revoked (durable): marked REVOKED with a permanent tombstone and audit record. It leaves the JWKS and stops being used within about one minute on every engine that can reach the database; an engine that cannot reach the database stops signing rather than use a cached key. Already-issued JWTs remain valid at external resource servers until their JWKS cache refreshes and the token exp passes. This revocation is irreversible; a successor key is promoted or generated automatically.", "key_id", id)
 	return nil
 }
 
