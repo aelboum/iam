@@ -207,7 +207,7 @@ func run() error {
 	if cfg.TrustProxy {
 		router.Use(forwardedFor(cfg.ProxyHops))
 	}
-	router.Use(middleware.Recoverer, securityHeaders, relaxCSPForFormPost, honestDiscovery, noStore, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
+	router.Use(middleware.Recoverer, securityHeaders, relaxCSPForFormPost, honestDiscovery, noStore, jwksCacheControl, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
@@ -670,6 +670,28 @@ func noStore(next http.Handler) http.Handler {
 		if noStorePaths[strings.TrimSuffix(r.URL.Path, "/")] {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Pragma", "no-cache")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// keysCacheMaxAge bounds how long a relying party may cache the JWKS, and so the
+// upper bound on how long a compliant resource server keeps trusting a revoked
+// key after it leaves /keys (CRYPTO-05, owner decision D1; recommended default).
+// The zitadel op /keys handler sets no Cache-Control of its own, so without this
+// the window is uncontrolled by IAM. It bounds compliant caches only; a resource
+// server that ignores the directive, and any already-issued JWT until its exp,
+// are outside IAM's control.
+const keysCacheMaxAge = 300
+
+// jwksCacheControl sets a bounded, explicit Cache-Control on GET /keys. It runs
+// before the mounted provider handler writes, and the handler sets no competing
+// Cache-Control, so the header is preserved.
+func jwksCacheControl(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			strings.TrimSuffix(r.URL.Path, "/") == "/keys" {
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", keysCacheMaxAge))
 		}
 		next.ServeHTTP(w, r)
 	})
