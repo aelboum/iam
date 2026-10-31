@@ -228,3 +228,94 @@ func TestPurgeExpiredRetainsTombstone(t *testing.T) {
 		t.Error("PurgeExpired removed a revocation tombstone")
 	}
 }
+
+// C1 (audit-failure injection): if the in-transaction audit INSERT fails, the
+// whole revocation must roll back — no tombstone, the key stays ACTIVE and
+// listed, and no partial audit evidence survives. A plpgsql BEFORE INSERT
+// trigger scoped to action='signing_key.revoke' forces the audit write (and
+// only that write) to fail deterministically, so this is isolation-safe even on
+// a shared test database. It proves RevokeSigningKey reports success only after
+// a durable commit and never leaves a key half-revoked.
+func TestRevokeSigningKeyAuditFailureRollsBack(t *testing.T) {
+	st, pool, ctx := openRevokeTestStore(t)
+	defer pool.Close()
+	id := insertTestKey(t, st, ctx)
+	defer pool.Exec(ctx, `DELETE FROM signing_keys WHERE id=$1`, id)
+	defer pool.Exec(ctx, `DELETE FROM revoked_signing_keys WHERE id=$1`, id)
+	defer pool.Exec(ctx, `DELETE FROM audit_events WHERE target=$1`, id)
+
+	// Force only the signing_key.revoke audit INSERT to fail.
+	if _, err := pool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION iam_test_fail_audit() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'injected audit failure'; END;
+		$$ LANGUAGE plpgsql`); err != nil {
+		t.Fatalf("create trigger fn: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE TRIGGER iam_test_fail_audit_trg BEFORE INSERT ON audit_events
+		FOR EACH ROW WHEN (NEW.action = 'signing_key.revoke')
+		EXECUTE FUNCTION iam_test_fail_audit()`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	defer pool.Exec(ctx, `DROP TRIGGER IF EXISTS iam_test_fail_audit_trg ON audit_events`)
+	defer pool.Exec(ctx, `DROP FUNCTION IF EXISTS iam_test_fail_audit()`)
+
+	if err := st.RevokeSigningKey(ctx, id, "system", "audit-fail"); err == nil {
+		t.Fatal("revoke must fail when the in-transaction audit write fails")
+	}
+
+	// Everything rolled back: no tombstone, key still ACTIVE and listed, no audit.
+	if tombstoned(t, pool, ctx, id) {
+		t.Error("tombstone persisted despite audit failure: revocation is not atomic")
+	}
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM signing_keys WHERE id=$1`, id).Scan(&state); err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if state != "ACTIVE" {
+		t.Errorf("state = %q, want ACTIVE (must roll back on audit failure)", state)
+	}
+	if !isListed(t, st, ctx, id) {
+		t.Error("key is not listed after rollback: a failed revocation must not suppress the key")
+	}
+	if n := auditCount(t, pool, ctx, id); n != 0 {
+		t.Errorf("audit events = %d, want 0 after rollback", n)
+	}
+}
+
+// C2 (cross-instance convergence): the database is the single authority, so a
+// key revoked through one Store is suppressed for an entirely independent Store
+// (separate connection pool, same database) the moment that instance re-reads
+// ListSigningKeys. This is the real multi-instance mechanism — each engine's
+// keyStore re-reads the authoritative list on cache expiry (bounded by
+// keyCacheTTL); there is no LISTEN/NOTIFY and none is needed for correctness.
+// This test proves the shared-authority half; the per-instance cache-expiry half
+// is covered by the oidcop seam and fail-closed tests. Live two-process timing
+// convergence still needs a dedicated multi-process engine harness.
+func TestRevocationVisibleAcrossIndependentStores(t *testing.T) {
+	stA, poolA, ctx := openRevokeTestStore(t)
+	defer poolA.Close()
+	id := insertTestKey(t, stA, ctx)
+	defer poolA.Exec(ctx, `DELETE FROM signing_keys WHERE id=$1`, id)
+	defer poolA.Exec(ctx, `DELETE FROM revoked_signing_keys WHERE id=$1`, id)
+	defer poolA.Exec(ctx, `DELETE FROM audit_events WHERE target=$1`, id)
+
+	// A second, fully independent instance against the same database.
+	poolB, err := pgxpool.New(ctx, os.Getenv("IAM_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("open instance B: %v", err)
+	}
+	defer poolB.Close()
+	stB := New(poolB)
+
+	if !isListed(t, stB, ctx, id) {
+		t.Fatal("instance B must list the key before revocation")
+	}
+	if err := stA.RevokeSigningKey(ctx, id, "system", "cross-instance"); err != nil {
+		t.Fatalf("revoke on instance A: %v", err)
+	}
+	// Instance B re-reads the authoritative store and no longer sees the key.
+	if isListed(t, stB, ctx, id) {
+		t.Error("revocation on instance A is not visible to independent instance B")
+	}
+}
