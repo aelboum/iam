@@ -58,6 +58,13 @@ func NewStorage(st *store.Store, an *authn.Service, box *secret.Box, cfg TokenCo
 	}
 }
 
+// SetSigningGate installs the CRYPTO-05 D3 fail-closed signing gate. When set,
+// the signing-key store refuses to return a key (for signing or JWKS
+// publication) while gate returns a non-nil error, i.e. until the engine has
+// reconciled its revocation state with the independent authority. Called once at
+// startup; passing nil clears the gate.
+func (s *Storage) SetSigningGate(gate func() error) { s.keys.gate = gate }
+
 // --- auth requests --------------------------------------------------------------------
 
 func (s *Storage) CreateAuthRequest(ctx context.Context, req *oidc.AuthRequest, userID string) (op.AuthRequest, error) {

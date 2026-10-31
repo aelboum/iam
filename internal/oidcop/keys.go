@@ -64,6 +64,13 @@ type keyStore struct {
 	cacheTTL time.Duration
 	pubLead  time.Duration
 
+	// gate, when set, is the CRYPTO-05 D3 fail-closed signing gate. current()
+	// calls it before returning any key; a non-nil error means the engine has not
+	// reconciled its revocation state with the independent authority and must not
+	// sign or publish keys. Left nil (the default) the gate is open, so existing
+	// behaviour and tests are unchanged until an authority is configured.
+	gate func() error
+
 	mu       sync.Mutex
 	keys     []*signingKey // newest first
 	loadedAt time.Time
@@ -81,6 +88,14 @@ func newKeyStore(st *store.Store, box *secret.Box, rotation time.Duration) *keyS
 }
 
 func (ks *keyStore) current(ctx context.Context) (*signingKey, []*signingKey, error) {
+	// CRYPTO-05 D3: refuse to sign or publish keys until the revocation state has
+	// been reconciled with the independent authority (fail closed).
+	if ks.gate != nil {
+		if err := ks.gate(); err != nil {
+			return nil, nil, fmt.Errorf("signing unavailable: revocation state not reconciled: %w", err)
+		}
+	}
+
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
 

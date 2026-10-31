@@ -411,7 +411,20 @@ func (s *Store) DeleteSigningKey(ctx context.Context, id string) error {
 // already tombstoned. Revocation is irreversible: a mistakenly revoked key stays
 // dead and the engine promotes or generates a successor.
 func (s *Store) RevokeSigningKey(ctx context.Context, id, actor, reason string) error {
-	detail, err := json.Marshal(map[string]any{"key_id": id, "reason": reason})
+	return s.RevokeSigningKeyWithDetail(ctx, id, actor, reason, nil)
+}
+
+// RevokeSigningKeyWithDetail is RevokeSigningKey with extra fields merged into
+// the audit event's detail. CRYPTO-05 D6 uses it to record the authenticated
+// operator identity, authorization role, break-glass context and correlation id
+// alongside the revocation, in the same atomic transaction as the tombstone.
+// extra must not contain secrets; callers are responsible for redaction.
+func (s *Store) RevokeSigningKeyWithDetail(ctx context.Context, id, actor, reason string, extra map[string]any) error {
+	d := map[string]any{"key_id": id, "reason": reason}
+	for k, v := range extra {
+		d[k] = v
+	}
+	detail, err := json.Marshal(d)
 	if err != nil {
 		return err
 	}
@@ -456,6 +469,68 @@ func (s *Store) RevokeSigningKey(ctx context.Context, id, actor, reason string) 
 		}
 		return nil
 	})
+}
+
+// EnsureSigningKeyRevoked re-applies a revocation during D3 reconciliation. The
+// independent revocation-epoch authority is the source of truth for which key
+// ids are revoked; after a restore/PITR the local database may be missing a
+// tombstone, or missing the signing_keys row entirely. This writes the tombstone
+// if absent (so the key stays suppressed even if a row reappears later), marks
+// any present row REVOKED, and records one reconciliation audit event — all in
+// one transaction and idempotently. Unlike RevokeSigningKey it does NOT return
+// ErrNotFound when the row is absent: a revoked key with no local row is exactly
+// the case this must tombstone.
+func (s *Store) EnsureSigningKeyRevoked(ctx context.Context, id, actor, reason string) error {
+	detail, err := json.Marshal(map[string]any{"key_id": id, "reason": reason, "via": "reconciliation"})
+	if err != nil {
+		return err
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			UPDATE signing_keys SET state='REVOKED', revoked_at=now(), revoked_reason=$2
+			WHERE id=$1 AND state <> 'REVOKED'`, id, reason); err != nil {
+			return mapErr(err)
+		}
+		var inserted string
+		err := tx.QueryRow(ctx, `
+			INSERT INTO revoked_signing_keys (id, revoked_by, reason)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO NOTHING
+			RETURNING id`, id, actor, reason).Scan(&inserted)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			return nil // already tombstoned: nothing to do
+		case err != nil:
+			return mapErr(err)
+		}
+		// Newly tombstoned by reconciliation: record one audit event.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_events (actor, action, target, detail)
+			VALUES ($1, 'signing_key.revoke.reconciled', $2, $3)`, actor, id, detail); err != nil {
+			return mapErr(err)
+		}
+		return nil
+	})
+}
+
+// ReconciledEpoch returns the highest revocation epoch this database has been
+// reconciled against (CRYPTO-05 D3). 0 means nothing reconciled yet.
+func (s *Store) ReconciledEpoch(ctx context.Context) (int64, error) {
+	var e int64
+	err := s.pool.QueryRow(ctx, `SELECT reconciled_epoch FROM revocation_reconciliation WHERE id`).Scan(&e)
+	return e, mapErr(err)
+}
+
+// SetReconciledEpoch advances the reconciliation marker to epoch. It is
+// forward-only: it never lowers the marker (GREATEST), so a stale or rolled-back
+// value can never erase prior reconciliation progress.
+func (s *Store) SetReconciledEpoch(ctx context.Context, epoch int64) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE revocation_reconciliation
+		SET reconciled_epoch = GREATEST(reconciled_epoch, $1),
+		    reconciled_at = now()
+		WHERE id`, epoch)
+	return mapErr(err)
 }
 
 // LockSigningKeys takes a transaction-scoped advisory lock so only one
