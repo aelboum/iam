@@ -257,8 +257,9 @@ func TestRevokeSigningKeyAuditFailureRollsBack(t *testing.T) {
 		EXECUTE FUNCTION iam_test_fail_audit()`); err != nil {
 		t.Fatalf("create trigger: %v", err)
 	}
-	defer pool.Exec(ctx, `DROP TRIGGER IF EXISTS iam_test_fail_audit_trg ON audit_events`)
-	defer pool.Exec(ctx, `DROP FUNCTION IF EXISTS iam_test_fail_audit()`)
+	// CASCADE also drops the dependent trigger, so teardown is order-independent
+	// and leaves no function behind on a shared test database.
+	defer pool.Exec(ctx, `DROP FUNCTION IF EXISTS iam_test_fail_audit() CASCADE`)
 
 	if err := st.RevokeSigningKey(ctx, id, "system", "audit-fail"); err == nil {
 		t.Fatal("revoke must fail when the in-transaction audit write fails")
