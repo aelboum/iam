@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -356,11 +358,19 @@ func (s *Store) InsertSigningKey(ctx context.Context, k *SigningKey) error {
 	return mapErr(err)
 }
 
-// ListSigningKeys returns keys that are still published, newest first.
+// ListSigningKeys returns keys that are still published, newest first. Keys in
+// the REVOKED state, and any key whose id appears in the revoked_signing_keys
+// tombstone, are excluded (CRYPTO-05): the tombstone is authoritative, so a key
+// never reappears in the JWKS even if a signing_keys row with the same id is
+// resurrected by a restored backup or a lagging replica.
 func (s *Store) ListSigningKeys(ctx context.Context) ([]*SigningKey, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, algorithm, private_key_enc, created_at, rotate_at, expires_at
-		FROM signing_keys WHERE expires_at > now() ORDER BY created_at DESC`)
+		FROM signing_keys
+		WHERE expires_at > now()
+		  AND state <> 'REVOKED'
+		  AND id NOT IN (SELECT id FROM revoked_signing_keys)
+		ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -376,13 +386,76 @@ func (s *Store) ListSigningKeys(ctx context.Context) ([]*SigningKey, error) {
 	return keys, mapErr(rows.Err())
 }
 
-// DeleteSigningKey permanently removes a signing key by id. It is the
-// emergency-revocation primitive (audit CRYPTO-05): once the row is gone,
-// ListSigningKeys no longer returns the key, so within one key-cache interval
-// every instance drops it from the published JWKS and relying parties reject
-// tokens it signed. Returns ErrNotFound if no such key exists.
+// DeleteSigningKey permanently removes a signing key by id. It is retained for
+// test fixtures and genuine hard-deletion needs; RevokeSigningKey is the
+// emergency-revocation primitive. Returns ErrNotFound if no such key exists.
 func (s *Store) DeleteSigningKey(ctx context.Context, id string) error {
 	return s.execOne(ctx, `DELETE FROM signing_keys WHERE id = $1`, id)
+}
+
+// RevokeSigningKey is the durable emergency-revocation primitive (CRYPTO-05).
+// In one transaction it marks the key REVOKED, writes a permanent tombstone, and
+// records a single audit event — all or nothing. Once committed, ListSigningKeys
+// stops returning the key, so within one key-cache interval every instance drops
+// it from the JWKS and stops signing with it; the tombstone keeps it suppressed
+// even if its signing_keys row later reappears.
+//
+// The operation is idempotent: a second revocation of the same id inserts no
+// second tombstone and no second audit event (the audit write is gated on the
+// tombstone insert actually adding a row), so an operator who re-runs after an
+// ambiguous COMMIT result cannot create duplicate revocation evidence. The audit
+// write uses the transaction handle directly, never the pool-bound, error-
+// swallowing Store.Audit, so success is reported only after a durable commit.
+//
+// Returns ErrNotFound if no signing_keys row with that id exists and it was not
+// already tombstoned. Revocation is irreversible: a mistakenly revoked key stays
+// dead and the engine promotes or generates a successor.
+func (s *Store) RevokeSigningKey(ctx context.Context, id, actor, reason string) error {
+	detail, err := json.Marshal(map[string]any{"key_id": id, "reason": reason})
+	if err != nil {
+		return err
+	}
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		// Mark the key REVOKED if a row exists and is not already revoked. This is
+		// idempotent on re-run and a no-op when the row is absent.
+		if _, err := tx.Exec(ctx, `
+			UPDATE signing_keys SET state='REVOKED', revoked_at=now(), revoked_reason=$2
+			WHERE id=$1 AND state <> 'REVOKED'`, id, reason); err != nil {
+			return mapErr(err)
+		}
+		// The tombstone is authoritative. ON CONFLICT DO NOTHING makes a repeat
+		// revocation a no-op; the RETURNING tells us whether this call is the one
+		// that actually recorded the revocation.
+		var inserted string
+		err := tx.QueryRow(ctx, `
+			INSERT INTO revoked_signing_keys (id, revoked_by, reason)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (id) DO NOTHING
+			RETURNING id`, id, actor, reason).Scan(&inserted)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// Already tombstoned: idempotent no-op, no duplicate audit event.
+			return nil
+		case err != nil:
+			return mapErr(err)
+		}
+		// Reject revoking an id that never existed as a key (and was not already
+		// tombstoned), rolling back the tombstone we just inserted.
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM signing_keys WHERE id=$1)`, id).Scan(&exists); err != nil {
+			return mapErr(err)
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		// Record exactly one audit event, in the same transaction.
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO audit_events (actor, action, target, detail)
+			VALUES ($1, 'signing_key.revoke', $2, $3)`, actor, id, detail); err != nil {
+			return mapErr(err)
+		}
+		return nil
+	})
 }
 
 // LockSigningKeys takes a transaction-scoped advisory lock so only one
