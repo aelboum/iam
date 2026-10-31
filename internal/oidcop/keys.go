@@ -19,10 +19,13 @@ import (
 )
 
 // keyCacheTTL bounds how long a rotated key can go unnoticed by other instances.
+// It is the production default for keyStore.cacheTTL; tests may shorten the
+// per-store field to exercise cache expiry deterministically.
 const keyCacheTTL = time.Minute
 
 // publishLead is how long a new key is published in the JWKS before it signs
 // anything, so every instance and relying party has seen it (> keyCacheTTL).
+// It is the production default for keyStore.pubLead.
 const publishLead = 3 * keyCacheTTL
 
 type signingKey struct {
@@ -52,37 +55,53 @@ type keyStore struct {
 	box      *secret.Box
 	rotation time.Duration
 
+	// now, cacheTTL and pubLead are a minimal seam (CRYPTO-05 Phase 1): they
+	// default to time.Now, keyCacheTTL and publishLead in production and are
+	// only overridden in tests so cache expiry and publication timing can be
+	// driven deterministically without sleeps. They never change behavior when
+	// left at their defaults.
+	now      func() time.Time
+	cacheTTL time.Duration
+	pubLead  time.Duration
+
 	mu       sync.Mutex
 	keys     []*signingKey // newest first
 	loadedAt time.Time
 }
 
 func newKeyStore(st *store.Store, box *secret.Box, rotation time.Duration) *keyStore {
-	return &keyStore{store: st, box: box, rotation: rotation}
+	return &keyStore{
+		store:    st,
+		box:      box,
+		rotation: rotation,
+		now:      time.Now,
+		cacheTTL: keyCacheTTL,
+		pubLead:  publishLead,
+	}
 }
 
 func (ks *keyStore) current(ctx context.Context) (*signingKey, []*signingKey, error) {
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
 
-	if time.Since(ks.loadedAt) > keyCacheTTL || len(ks.keys) == 0 || needsNewKey(ks.keys) {
+	if ks.now().Sub(ks.loadedAt) > ks.cacheTTL || len(ks.keys) == 0 || needsNewKey(ks.keys, ks.now(), ks.pubLead) {
 		if err := ks.reload(ctx); err != nil {
 			return nil, nil, err
 		}
 	}
-	return signer(ks.keys), ks.keys, nil
+	return signer(ks.keys, ks.now(), ks.pubLead), ks.keys, nil
 }
 
 // needsNewKey reports whether the newest key is close enough to rotation
 // that its successor must be published now.
-func needsNewKey(keys []*signingKey) bool {
-	return len(keys) == 0 || time.Now().After(keys[0].rotateAt.Add(-publishLead))
+func needsNewKey(keys []*signingKey, now time.Time, pubLead time.Duration) bool {
+	return len(keys) == 0 || now.After(keys[0].rotateAt.Add(-pubLead))
 }
 
 // signer picks the newest key that has been published for at least
-// publishLead. Right after first start there is only one key, which is used.
-func signer(keys []*signingKey) *signingKey {
-	cutoff := time.Now().Add(-publishLead)
+// pubLead. Right after first start there is only one key, which is used.
+func signer(keys []*signingKey, now time.Time, pubLead time.Duration) *signingKey {
+	cutoff := now.Add(-pubLead)
 	for _, k := range keys { // newest first
 		if !k.createdAt.After(cutoff) {
 			return k
@@ -96,13 +115,13 @@ func (ks *keyStore) reload(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if needsNewKey(keys) {
+	if needsNewKey(keys, ks.now(), ks.pubLead) {
 		err := ks.store.LockSigningKeys(ctx, func(ctx context.Context) error {
 			// Another instance may have rotated while we waited for the lock.
 			if keys, err = ks.load(ctx); err != nil {
 				return err
 			}
-			if !needsNewKey(keys) {
+			if !needsNewKey(keys, ks.now(), ks.pubLead) {
 				return nil
 			}
 			if err := ks.generate(ctx); err != nil {
@@ -119,7 +138,7 @@ func (ks *keyStore) reload(ctx context.Context) error {
 		return errors.New("no signing key available")
 	}
 	ks.keys = keys
-	ks.loadedAt = time.Now()
+	ks.loadedAt = ks.now()
 	return nil
 }
 
@@ -156,7 +175,7 @@ func (ks *keyStore) generate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	now := time.Now()
+	now := ks.now()
 	return ks.store.InsertSigningKey(ctx, &store.SigningKey{
 		ID:            uuid.NewString(),
 		Algorithm:     string(jose.RS256),
