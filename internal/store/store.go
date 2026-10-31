@@ -18,6 +18,9 @@ var (
 	ErrInvalidReference = errors.New("referenced resource does not exist")
 	// ErrInvalidRole is returned when role keys are not defined or not granted.
 	ErrInvalidRole = errors.New("role not defined or not granted")
+	// ErrUnauthorized is returned when a caller is authenticated but lacks the
+	// capability required for an operation (CRYPTO-05 D6 signing-key revocation).
+	ErrUnauthorized = errors.New("not authorized")
 )
 
 type Store struct {
