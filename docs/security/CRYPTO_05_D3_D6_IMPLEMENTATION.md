@@ -104,6 +104,20 @@ closed gate.
 Never lower the authority epoch to match a restored database. Never reactivate a
 revoked key or delete a tombstone to recover service.
 
+### 1.6 Operational demonstration
+
+`scripts/d3_restore_demo.sh` (with the build-tagged helper `scripts/d3demo`)
+demonstrates the full cycle against real databases and a **real `pg_dump`
+restore**, independent of the unit tests: it stands up a disposable PostgreSQL
+with two independent databases (IAM and the authority), creates and publishes a
+signing key, snapshots the IAM database, revokes the key, **restores the IAM
+database to the pre-revocation snapshot** (which resurrects the key locally),
+then shows that reconciliation against the untouched authority re-suppresses the
+key, and that with the authority unreachable the signing gate fails closed. It
+prints a PASS per step. This is an operational demonstration in a disposable
+environment; it is not a production deployment and does not substitute for the
+production-authority prerequisite in §4.
+
 ---
 
 ## 2. D6 — signing-key revocation authorization
