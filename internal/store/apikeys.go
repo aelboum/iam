@@ -24,14 +24,18 @@ type APIKey struct {
 	ExpiresAt  *time.Time `json:"expires_at"`
 	CreatedAt  time.Time  `json:"created_at"`
 	LastUsedAt *time.Time `json:"last_used_at"`
+	// CanRevokeKeys is the dedicated CRYPTO-05 D6 signing-key revocation
+	// capability. It is independent of Scope and defaults to false, so no key may
+	// revoke a signing key unless explicitly granted.
+	CanRevokeKeys bool `json:"can_revoke_keys"`
 }
 
 // #nosec G101 -- SQL column list, not a credential.
-const apiKeyColumns = `id, name, org_id, scope, expires_at, created_at, last_used_at`
+const apiKeyColumns = `id, name, org_id, scope, expires_at, created_at, last_used_at, can_revoke_keys`
 
 func scanAPIKey(row interface{ Scan(...any) error }) (*APIKey, error) {
 	var k APIKey
-	if err := row.Scan(&k.ID, &k.Name, &k.OrgID, &k.Scope, &k.ExpiresAt, &k.CreatedAt, &k.LastUsedAt); err != nil {
+	if err := row.Scan(&k.ID, &k.Name, &k.OrgID, &k.Scope, &k.ExpiresAt, &k.CreatedAt, &k.LastUsedAt, &k.CanRevokeKeys); err != nil {
 		return nil, mapErr(err)
 	}
 	return &k, nil

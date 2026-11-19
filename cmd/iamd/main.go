@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -29,6 +30,8 @@ import (
 	"github.com/aelboum/iam/internal/docs"
 	"github.com/aelboum/iam/internal/oidcop"
 	"github.com/aelboum/iam/internal/ratelimit"
+	"github.com/aelboum/iam/internal/revepoch"
+	"github.com/aelboum/iam/internal/revocation"
 	"github.com/aelboum/iam/internal/secret"
 	"github.com/aelboum/iam/internal/sizing"
 	"github.com/aelboum/iam/internal/store"
@@ -56,16 +59,41 @@ func main() {
 		}
 		return
 	}
-	// `iamd revoke-key <key-id>` is the emergency response to a leaked signing
-	// key: it drops the key so every instance stops publishing and trusting it
-	// within one key-cache interval (audit CRYPTO-05).
+	// `iamd revoke-key [--break-glass] --reason <why> <key-id>` is the emergency
+	// response to a leaked signing key. It requires an authenticated operator
+	// authorized to revoke (CRYPTO-05 D6) and records the revocation in the
+	// independent authority before the local commit (CRYPTO-05 D3).
 	if len(os.Args) > 1 && os.Args[1] == "revoke-key" {
+		if err := revokeSigningKey(os.Args[2:]); err != nil {
+			slog.Error("revoke-key failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// `iamd grant-revoker <api-key-id>` grants the signing_key_revoker capability
+	// to an existing API key (CRYPTO-05 D6 provisioning). It is a deployment-time
+	// admin action: it requires database and master-key access, which is
+	// root-equivalent and outside the D6 runtime threat model.
+	if len(os.Args) > 1 && os.Args[1] == "grant-revoker" {
 		if len(os.Args) < 3 || os.Args[2] == "" {
-			slog.Error("revoke-key needs a signing-key id: iamd revoke-key <key-id>")
+			slog.Error("grant-revoker needs an API key id: iamd grant-revoker <api-key-id>")
 			os.Exit(2)
 		}
-		if err := revokeSigningKey(os.Args[2]); err != nil {
-			slog.Error("revoke-key failed", "error", err)
+		if err := grantRevoker(os.Args[2]); err != nil {
+			slog.Error("grant-revoker failed", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+	// `iamd add-break-glass <label>` registers the break-glass credential supplied
+	// in IAM_BREAKGLASS_KEY (stored only as a hash). Deployment-time admin action.
+	if len(os.Args) > 1 && os.Args[1] == "add-break-glass" {
+		label := ""
+		if len(os.Args) > 2 {
+			label = os.Args[2]
+		}
+		if err := addBreakGlass(label); err != nil {
+			slog.Error("add-break-glass failed", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -196,6 +224,22 @@ func run() error {
 		RefreshIdle:   cfg.RefreshIdle,
 		SessionMaxAge: cfg.SessionMaxAge,
 	})
+	// CRYPTO-05 D3: when an independent revocation-epoch authority is configured,
+	// gate signing behind reconciliation with it (fail closed). This is what
+	// protects against a PostgreSQL restore/PITR resurrecting a revoked key. When
+	// it is not configured, signing proceeds unprotected and we log that loudly —
+	// a documented operational prerequisite for production, not a silent default.
+	if auth, authPool, aerr := openRevocationAuthority(ctx); aerr != nil {
+		return aerr
+	} else if auth != nil {
+		defer authPool.Close()
+		runner, gate := revocation.NewRunner(st, auth, time.Minute, slog.Default())
+		storage.SetSigningGate(gate.Err)
+		go runner.Run(ctx)
+		slog.Info("CRYPTO-05 D3 revocation-epoch protection enabled; signing is gated until the engine reconciles with the independent authority")
+	} else {
+		slog.Warn("CRYPTO-05 D3 revocation-epoch protection DISABLED: IAM_REVOCATION_AUTHORITY_URL is not set. A PostgreSQL restore/PITR cannot be protected against signing-key resurrection until an independent authority is configured.")
+	}
 	provider, err := oidcop.NewProvider(cfg.Issuer, cfg.MasterKey, cfg.PreviousMasterKeys, cfg.DevMode, storage)
 	if err != nil {
 		return err
@@ -207,7 +251,7 @@ func run() error {
 	if cfg.TrustProxy {
 		router.Use(forwardedFor(cfg.ProxyHops))
 	}
-	router.Use(middleware.Recoverer, securityHeaders, relaxCSPForFormPost, honestDiscovery, noStore, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
+	router.Use(middleware.Recoverer, securityHeaders, relaxCSPForFormPost, honestDiscovery, noStore, jwksCacheControl, cors(cfg.CORSOrigins), limitOAuthEndpoints(limits))
 	router.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := st.Ping(r.Context()); err != nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
@@ -400,14 +444,42 @@ func purgeOnce() error {
 	return st.PurgeRateLimits(ctx)
 }
 
-// revokeSigningKey is the emergency response to a leaked signing key (audit
-// CRYPTO-05). It drops the key from the database so that, within one key-cache
-// interval, every running instance stops publishing it in the JWKS and signing
-// with it, and relying parties reject the tokens it signed — bounding a leaked
-// key to minutes instead of its full lifetime. If this removed the last usable
-// key, a running engine promotes a published successor or generates a new key
-// on its next key reload, so signing continues.
-func revokeSigningKey(id string) error {
+// revokeSigningKey is the emergency response to a leaked signing key (CRYPTO-05).
+// It durably revokes the key: the key is marked REVOKED, a permanent tombstone is
+// written and a single audit event is recorded, all in one transaction, so the
+// revocation survives restart and cannot be resurrected by a reappearing row.
+// Within one key-cache interval every running engine stops publishing the key in
+// the JWKS and signing with it, provided the database is reachable at its next
+// reload; an engine that cannot reach the database stops signing rather than keep
+// using a cached key. If this was the active signer, a running engine promotes a
+// published successor or generates a new key on its next reload, so signing
+// continues. The reason is read from IAM_REVOKE_REASON when set.
+//
+// Already-issued JWT access tokens remain valid at external resource servers
+// until their JWKS cache refreshes and the token exp passes; IAM cannot recall
+// them. Revocation is irreversible for this key.
+func revokeSigningKey(args []string) error {
+	fs := flag.NewFlagSet("revoke-key", flag.ContinueOnError)
+	breakGlass := fs.Bool("break-glass", false, "use the emergency break-glass credential (IAM_BREAKGLASS_KEY) instead of an operator API key")
+	reasonFlag := fs.String("reason", "", "mandatory human reason for the revocation")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) < 1 || rest[0] == "" {
+		return errors.New("usage: iamd revoke-key [--break-glass] --reason <why> <key-id>")
+	}
+	id := rest[0]
+
+	// D6: a reason is mandatory and must be explicit.
+	reason := *reasonFlag
+	if reason == "" {
+		reason = os.Getenv("IAM_REVOKE_REASON")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return errors.New("a revocation reason is required (--reason or IAM_REVOKE_REASON)")
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -422,10 +494,142 @@ func revokeSigningKey(id string) error {
 		return err
 	}
 	st := store.New(pool)
-	if err := st.DeleteSigningKey(ctx, id); err != nil {
+
+	// D6: establish the authenticated, authorized operator identity. Identity
+	// comes from a verified credential, never from a caller-supplied string.
+	var ident *store.RevokerIdentity
+	if *breakGlass {
+		bg := os.Getenv("IAM_BREAKGLASS_KEY")
+		operatorID := os.Getenv("IAM_OPERATOR_ID")
+		if bg == "" {
+			return errors.New("break-glass requires IAM_BREAKGLASS_KEY")
+		}
+		if strings.TrimSpace(operatorID) == "" {
+			return errors.New("break-glass requires IAM_OPERATOR_ID to attribute the emergency action")
+		}
+		ident, err = st.AuthorizeBreakGlass(ctx, secret.Hash(bg), operatorID, id)
+	} else {
+		opKey := os.Getenv("IAM_OPERATOR_API_KEY")
+		if opKey == "" {
+			return errors.New("revoke-key requires IAM_OPERATOR_API_KEY (an API key granted the signing_key_revoker capability), or --break-glass")
+		}
+		ident, err = st.AuthorizeKeyRevoker(ctx, secret.Hash(opKey), id)
+	}
+	if err != nil {
+		// ErrUnauthorized has already been audited by the store.
 		return err
 	}
-	slog.Warn("signing key revoked: it leaves the JWKS and stops being accepted within ~1 minute across all instances, and tokens it signed are then rejected. If it was the active signer, a running engine promotes a successor or generates a new key on its next reload.", "key_id", id)
+
+	// D3: record the revocation in the independent authority BEFORE the local
+	// commit. If the process dies after this point, the authority stays ahead of
+	// the local epoch and the startup gate re-applies the revocation, so the key
+	// can never resume signing just because the local transaction did not finish.
+	auth, authPool, err := openRevocationAuthority(ctx)
+	if err != nil {
+		return err
+	}
+	epoch := int64(-1)
+	if auth != nil {
+		defer authPool.Close()
+		e, rerr := auth.Record(ctx, id)
+		if rerr != nil {
+			return fmt.Errorf("record revocation in independent authority: %w", rerr)
+		}
+		epoch = int64(e)
+	} else {
+		slog.Warn("IAM_REVOCATION_AUTHORITY_URL is not set: revoking WITHOUT restore/PITR epoch protection (CRYPTO-05 D3). Configure an independent revocation authority before production.")
+	}
+
+	// Local durable revoke with full operator attribution (D6), atomic.
+	extra := map[string]any{
+		"authorized":      true,
+		"authorized_role": ident.Role,
+		"break_glass":     ident.BreakGlass,
+	}
+	if epoch >= 0 {
+		extra["revocation_epoch"] = epoch
+	}
+	if err := st.RevokeSigningKeyWithDetail(ctx, id, ident.Actor, reason, extra); err != nil {
+		return err
+	}
+
+	// Advance the local reconciliation marker to match the authority.
+	if auth != nil {
+		if _, rerr := revocation.Reconcile(ctx, st, auth); rerr != nil {
+			slog.Warn("post-revocation reconciliation incomplete; the startup gate will reconcile on next start", "error", rerr)
+		}
+	}
+	slog.Warn("signing key revoked (durable). It leaves the JWKS and stops being used within about one key-cache interval on every engine that can reach the database; an engine that cannot reach the database stops signing rather than use a cached key. Already-issued JWTs remain valid at external resource servers until their JWKS cache refreshes and the token exp passes. This revocation is irreversible; a successor key is promoted or generated automatically.",
+		"key_id", id, "actor", ident.Actor, "role", ident.Role, "break_glass", ident.BreakGlass)
+	return nil
+}
+
+// openRevocationAuthority opens the independent revocation-epoch authority from
+// IAM_REVOCATION_AUTHORITY_URL. It returns (nil, nil, nil) when unset, meaning
+// D3 restore/PITR protection is DISABLED — callers log this loudly. The URL must
+// point at a database operationally separate from the IAM database.
+func openRevocationAuthority(ctx context.Context) (*revepoch.PGAuthority, interface{ Close() }, error) {
+	url := os.Getenv("IAM_REVOCATION_AUTHORITY_URL")
+	if strings.TrimSpace(url) == "" {
+		return nil, nil, nil
+	}
+	pool, err := db.Open(ctx, url)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open revocation authority: %w", err)
+	}
+	a := revepoch.NewPGAuthority(pool)
+	if err := a.Migrate(ctx); err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("migrate revocation authority: %w", err)
+	}
+	return a, pool, nil
+}
+
+// grantRevoker grants the signing_key_revoker capability to an API key.
+func grantRevoker(apiKeyID string) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := db.Migrate(ctx, pool); err != nil {
+		return err
+	}
+	if err := store.New(pool).SetKeyRevoker(ctx, apiKeyID, true); err != nil {
+		return err
+	}
+	slog.Info("granted signing_key_revoker capability", "api_key_id", apiKeyID)
+	return nil
+}
+
+// addBreakGlass registers the break-glass credential from IAM_BREAKGLASS_KEY.
+func addBreakGlass(label string) error {
+	bg := os.Getenv("IAM_BREAKGLASS_KEY")
+	if len(bg) < 32 {
+		return errors.New("add-break-glass requires IAM_BREAKGLASS_KEY of at least 32 characters")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	pool, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := db.Migrate(ctx, pool); err != nil {
+		return err
+	}
+	if err := store.New(pool).AddBreakGlassKey(ctx, secret.Hash(bg), label); err != nil {
+		return err
+	}
+	slog.Info("registered break-glass credential", "label", label)
 	return nil
 }
 
@@ -657,6 +861,28 @@ func noStore(next http.Handler) http.Handler {
 		if noStorePaths[strings.TrimSuffix(r.URL.Path, "/")] {
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Pragma", "no-cache")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// keysCacheMaxAge bounds how long a relying party may cache the JWKS, and so the
+// upper bound on how long a compliant resource server keeps trusting a revoked
+// key after it leaves /keys (CRYPTO-05, owner decision D1; recommended default).
+// The zitadel op /keys handler sets no Cache-Control of its own, so without this
+// the window is uncontrolled by IAM. It bounds compliant caches only; a resource
+// server that ignores the directive, and any already-issued JWT until its exp,
+// are outside IAM's control.
+const keysCacheMaxAge = 300
+
+// jwksCacheControl sets a bounded, explicit Cache-Control on GET /keys. It runs
+// before the mounted provider handler writes, and the handler sets no competing
+// Cache-Control, so the header is preserved.
+func jwksCacheControl(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			strings.TrimSuffix(r.URL.Path, "/") == "/keys" {
+			w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", keysCacheMaxAge))
 		}
 		next.ServeHTTP(w, r)
 	})
